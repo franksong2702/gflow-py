@@ -882,7 +882,7 @@ def create_server(
                         data["metadata_dimensions_source"] = getattr(item, "dimensions_source", None)
                 else:
                     data["dimension_mismatch"] = None
-            else:
+            elif verify_dimensions:
                 data["dimension_probe_failed"] = True
         return data
 
@@ -1346,7 +1346,9 @@ def create_server(
             idempotency_key=idempotency_key,
             submit_fn=_do_export,
             params_fingerprint=_params_fingerprint(
-                _with_effective_project({"scene_id": scene_id.strip(), "project_id": project_id})
+                _with_effective_project(
+                    {"scene_id": scene_id.strip(), "project_id": project_id, "output_path": output_path}
+                )
             ),
         )
         result = {

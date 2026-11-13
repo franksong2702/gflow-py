@@ -257,13 +257,11 @@ def test_flow_scene_export_reports_measured_dimensions(monkeypatch, tmp_path: Pa
         assert replay["measured_width"] == 720
         assert mock.scene_exports == 1
 
-        # Same key, same scene, different local output_path: still a replay (output_path is not part of the fingerprint).
-        again = hardening._extract_json(
+        # Same key, same scene, different local output_path: rejected (a replay would silently skip the copy).
+        with pytest.raises(ToolError):
             await server.call_tool(
                 "flow_scene_export_mp4", {**args, "output_path": str(tmp_path / "elsewhere.mp4")}
             )
-        )
-        assert again["idempotent_replay"] is True
         assert mock.scene_exports == 1
 
         # Same key, different scene: rejected.
