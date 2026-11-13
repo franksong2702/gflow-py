@@ -51,25 +51,32 @@ def _find_child(data: bytes, start: int, end: int, box_type: bytes) -> tuple[int
     return None
 
 
-def _parse_tkhd(data: bytes, start: int, end: int) -> tuple[int, int] | None:
-    """Return the track presentation size (16.16 fixed point) honouring 90/270 degree rotation matrices."""
+def _parse_tkhd(data: bytes, start: int, end: int) -> tuple[bool, tuple[int, int] | None, bool] | None:
+    """Parse ``tkhd`` -> ``(track_enabled, display_dims_or_None, rotated_90_270)``.
+
+    Dimensions are 16.16 fixed point and are returned with width/height already swapped when the
+    transformation matrix is a 90/270 degree rotation. Returns ``None`` for an unknown ``tkhd`` version.
+    """
     if end - start < 4:
         return None
     version = data[start]
+    if version not in (0, 1):
+        return None
+    flags = int.from_bytes(data[start + 1 : start + 4], "big")
     base = start + 4 + (32 if version == 1 else 20)
     matrix_off = base + 8 + 2 + 2 + 2 + 2  # reserved[8], layer, alternate_group, volume, reserved
     wh_off = matrix_off + 36
     if wh_off + 8 > end:
         return None
+    a, b, _u, c, d = struct.unpack_from(">iiiii", data, matrix_off)
+    rotated = a == 0 and d == 0 and b != 0 and c != 0
     w_raw, h_raw = struct.unpack_from(">II", data, wh_off)
     width = round(w_raw / 65536)
     height = round(h_raw / 65536)
-    if width <= 0 or height <= 0:
-        return None
-    a, b, _u, c, d = struct.unpack_from(">iiiii", data, matrix_off)
-    if a == 0 and d == 0 and b != 0 and c != 0:
-        width, height = height, width
-    return width, height
+    dims: tuple[int, int] | None = None
+    if width > 0 and height > 0:
+        dims = (height, width) if rotated else (width, height)
+    return bool(flags & 0x1), dims, rotated
 
 
 def _parse_stsd(data: bytes, start: int, end: int) -> tuple[int, int] | None:
@@ -103,26 +110,46 @@ def _measure(buf: bytes) -> tuple[int, int] | None:
     moov = _find_child(buf, 0, len(buf), b"moov")
     if moov is None:
         return None
-    fallback: tuple[int, int] | None = None
+    # Candidate tiers (best first): enabled video track with a visual sample entry; enabled video track
+    # with tkhd size only; any video track. Tracks of unknown handler only count with a visual sample entry.
+    tiers: list[tuple[int, int] | None] = [None, None, None]
     for box_type, t_start, t_end in _iter_boxes(buf, moov[0], moov[1]):
         if box_type != b"trak":
             continue
+        enabled = True
         tkhd_dims: tuple[int, int] | None = None
+        rotated = False
         stsd_dims: tuple[int, int] | None = None
         handler: bytes | None = None
         for c_type, c_start, c_end in _iter_boxes(buf, t_start, t_end):
             if c_type == b"tkhd":
-                tkhd_dims = _parse_tkhd(buf, c_start, c_end)
+                parsed = _parse_tkhd(buf, c_start, c_end)
+                if parsed is not None:
+                    enabled, tkhd_dims, rotated = parsed
             elif c_type == b"mdia":
                 handler, stsd_dims = _parse_mdia(buf, c_start, c_end)
+        if stsd_dims is not None and rotated:
+            stsd_dims = (stsd_dims[1], stsd_dims[0])
+        if handler not in (b"vide", None):
+            continue
+        if handler is None:
+            # Unknown handler (missing/truncated hdlr): trust only a real visual sample entry; a bare
+            # tkhd size is the weakest candidate (could be a subtitle/metadata track).
+            if stsd_dims is not None and enabled:
+                tiers[0] = tiers[0] or stsd_dims
+            elif tkhd_dims is not None:
+                tiers[2] = tiers[2] or tkhd_dims
+            continue
         dims = tkhd_dims or stsd_dims
         if dims is None:
             continue
-        if handler == b"vide":
-            return dims
-        if handler is None and fallback is None:
-            fallback = dims
-    return fallback
+        if enabled and stsd_dims is not None:
+            tiers[0] = tiers[0] or dims
+        elif enabled:
+            tiers[1] = tiers[1] or dims
+        else:
+            tiers[2] = tiers[2] or dims
+    return tiers[0] or tiers[1] or tiers[2]
 
 
 def measure_mp4_dimensions(data: bytes) -> tuple[int, int] | None:

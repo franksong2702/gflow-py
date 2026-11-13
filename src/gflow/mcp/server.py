@@ -11,6 +11,7 @@ import hashlib
 import inspect
 import json
 import mimetypes
+import shutil
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -61,15 +62,39 @@ _PROFILE_SWITCH_DISABLED = (
 )
 
 
+def _norm_param(value: Any) -> Any:
+    """Canonicalise a parameter for fingerprinting: strings are stripped + lower-cased (enum-like values)."""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (list, tuple)):
+        return [_norm_param(v) for v in value]
+    return value
+
+
+_FREE_TEXT_PARAMS = frozenset({"prompt", "scene_id", "video_media_id", "start_frame_media_id",
+                               "end_frame_media_id", "base_image_media_id", "reference_media_ids",
+                               "project_id", "output_path"})
+
+
 def _params_fingerprint(params: dict[str, Any] | None) -> str | None:
     """Stable SHA-256 of the output-affecting tool parameters (``None`` when no params are supplied).
 
     Used so that reusing an ``idempotency_key`` with changed parameters (e.g. 16:9 -> 9:16) is rejected
-    instead of silently replaying the old job.
+    instead of silently replaying the old job. Enum-like values (model / aspect / resolution / target)
+    are normalised so a retry that differs only by case or whitespace is still a replay; ids and prompt
+    text are only stripped, never case-folded.
     """
     if params is None:
         return None
-    blob = json.dumps(params, sort_keys=True, default=str)
+    canon: dict[str, Any] = {}
+    for k, v in params.items():
+        if k in _FREE_TEXT_PARAMS:
+            canon[k] = [x.strip() if isinstance(x, str) else x for x in v] if isinstance(v, list) else (
+                v.strip() if isinstance(v, str) else v
+            )
+        else:
+            canon[k] = _norm_param(v)
+    blob = json.dumps(canon, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -363,6 +388,20 @@ def create_server(
         all_done = bool(items) and all(bool(it.download_url) for it in items)
         return ("completed" if all_done else "running"), items
 
+    def _with_effective_project(params: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Replace an omitted ``project_id`` with the profile's active project so the idempotency
+        fingerprint reflects the project the job will really target."""
+        if params is None or "project_id" not in params:
+            return params
+        pid = params.get("project_id")
+        if isinstance(pid, str) and pid.strip():
+            return params
+        try:
+            active = load_context(resolved_profile).get("project_id")
+        except Exception:
+            active = None
+        return {**params, "project_id": active}
+
     async def _run_media_generation_job(
         *,
         op: str,
@@ -388,7 +427,7 @@ def create_server(
             op=op,
             idempotency_key=idempotency_key,
             submit_fn=_submit,
-            params_fingerprint=_params_fingerprint(params),
+            params_fingerprint=_params_fingerprint(_with_effective_project(params)),
         )
         media_ids: list[str] = list(record.get("media_ids") or [])
         status, items = await _poll_soft(
@@ -811,14 +850,22 @@ def create_server(
         item = await client.get_media(media_id)
         data = _serialize_media(item, file_transfer)
         data.setdefault("dimensions_source", getattr(item, "dimensions_source", None))
+        is_video = item.media_type == "video" or (item.mime_type or "").startswith("video/")
+        want_probe = is_video and (include_checksum or verify_dimensions)
         raw_bytes: bytes | None = None
-        if (include_checksum or verify_dimensions) and item.download_url:
+        if output_path is not None:
+            # Download once to disk, then checksum/probe the saved file (no second download).
+            saved = await client.download_media(item, output_path=output_path)
+            data["saved_path"] = str(saved)
+            if include_checksum or want_probe:
+                raw_bytes = saved.read_bytes()
+        elif (include_checksum or want_probe) and item.download_url:
             raw_bytes, _ = await client._rpc.download_bytes(item.download_url)
         if include_checksum and raw_bytes is not None:
             data["file_size_bytes"] = len(raw_bytes)
             data["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
-        if raw_bytes is not None:
-            measured = measure_mp4_dimensions(raw_bytes)
+        if want_probe:
+            measured = measure_mp4_dimensions(raw_bytes) if raw_bytes is not None else None
             if measured is not None:
                 m_w, m_h = measured
                 data["measured_width"] = m_w
@@ -833,11 +880,10 @@ def create_server(
                         data["metadata_width"] = item.width
                         data["metadata_height"] = item.height
                         data["metadata_dimensions_source"] = getattr(item, "dimensions_source", None)
-            elif verify_dimensions:
+                else:
+                    data["dimension_mismatch"] = None
+            else:
                 data["dimension_probe_failed"] = True
-        if output_path is not None:
-            saved = await client.download_media(item, output_path=output_path)
-            data["saved_path"] = str(saved)
         return data
 
     @mcp.tool()
@@ -1277,7 +1323,7 @@ def create_server(
                     custom_dest = custom_dest / export_fname
                 custom_dest.parent.mkdir(parents=True, exist_ok=True)
                 if custom_dest.resolve() != saved.resolve():
-                    custom_dest.write_bytes(saved.read_bytes())
+                    shutil.copyfile(saved, custom_dest)
 
             size_bytes, sha_hex = compute_file_checksum(saved)
             measured = measure_mp4_dimensions(saved.read_bytes())
@@ -1290,6 +1336,7 @@ def create_server(
                 "upstream_mp4_url": upstream_url,
                 "file_size_bytes": size_bytes,
                 "sha256": sha_hex,
+                "dimensions_source": "measured_mp4" if measured else None,
                 "measured_width": measured[0] if measured else None,
                 "measured_height": measured[1] if measured else None,
             }
@@ -1299,7 +1346,7 @@ def create_server(
             idempotency_key=idempotency_key,
             submit_fn=_do_export,
             params_fingerprint=_params_fingerprint(
-                {"scene_id": scene_id.strip(), "project_id": project_id, "output_path": output_path}
+                _with_effective_project({"scene_id": scene_id.strip(), "project_id": project_id})
             ),
         )
         result = {

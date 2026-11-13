@@ -253,7 +253,7 @@ def _omni_oriented_key(
     if not is_portrait:
         return base_key
     portrait_key = f"{base_key}_portrait"
-    if not extra_valid_keys:
+    if extra_valid_keys is None:
         return portrait_key
     return portrait_key if portrait_key in extra_valid_keys else base_key
 
@@ -1188,7 +1188,7 @@ def parse_media_item(entry: Any) -> MediaItem | None:
 
     # Provenance of width/height: real values present in the response are "reported"; values derived
     # below from the aspect-ratio / resolution enum codes are flagged "inferred_from_aspect".
-    dims_source: str | None = "reported" if (width is not None and height is not None) else None
+    dims_source: str | None = None
     if isinstance(vid_box, list) and vid_box:
         media_type = "video"
         vid_aspect_code = spec_aspect_code
@@ -1229,6 +1229,8 @@ def parse_media_item(entry: Any) -> MediaItem | None:
                 width, height = long_side, short_side
             else:  # 1:1 square
                 width, height = short_side, short_side
+    if dims_source is None and width is not None and height is not None:
+        dims_source = "reported"
 
     if status == "completed" and not (image_url or video_url):
         # Still rendering if neither image_url nor video_url has materialized yet

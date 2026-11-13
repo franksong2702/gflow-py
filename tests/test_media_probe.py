@@ -257,10 +257,55 @@ def test_flow_scene_export_reports_measured_dimensions(monkeypatch, tmp_path: Pa
         assert replay["measured_width"] == 720
         assert mock.scene_exports == 1
 
-        with pytest.raises(ToolError):
+        # Same key, same scene, different local output_path: still a replay (output_path is not part of the fingerprint).
+        again = hardening._extract_json(
             await server.call_tool(
                 "flow_scene_export_mp4", {**args, "output_path": str(tmp_path / "elsewhere.mp4")}
             )
+        )
+        assert again["idempotent_replay"] is True
+        assert mock.scene_exports == 1
+
+        # Same key, different scene: rejected.
+        with pytest.raises(ToolError):
+            await server.call_tool("flow_scene_export_mp4", {**args, "scene_id": "scene-other-02"})
         assert mock.scene_exports == 1
 
     asyncio.run(main())
+
+
+def _trak_full(*, handler: bytes | None, width: int, height: int, entry: tuple[bytes, int, int] | None = None,
+               flags: int = 3, matrix: tuple[int, ...] = _IDENTITY, version: int = 0) -> bytes:
+    tk = bytearray(_tkhd(width, height, matrix=matrix, version=version))
+    tk[8 + 1 : 8 + 4] = flags.to_bytes(3, "big")  # box header(8) + version(1) -> flags
+    mdia_body = b""
+    if handler is not None:
+        mdia_body += _hdlr(handler)
+    if entry is not None:
+        stsd = _box(b"stsd", b"\x00" * 4 + struct.pack(">I", 1) + _visual_entry(*entry))
+        mdia_body += _box(b"minf", _box(b"stbl", stsd))
+    return _box(b"trak", bytes(tk) + _box(b"mdia", mdia_body))
+
+
+def test_cover_art_track_does_not_win_over_real_video_track() -> None:
+    cover = _trak_full(handler=b"vide", width=512, height=512, flags=0, entry=(b"avc1", 512, 512))
+    real = _trak_full(handler=b"vide", width=1080, height=1920, entry=(b"avc1", 1080, 1920))
+    assert measure_mp4_dimensions(_ftyp() + _box(b"moov", cover + real)) == (1080, 1920)
+
+
+def test_subtitle_track_with_truncated_hdlr_is_ignored_when_video_exists() -> None:
+    sub = _trak_full(handler=None, width=1280, height=100)
+    real = _trak_full(handler=b"vide", width=720, height=1280, entry=(b"avc1", 720, 1280))
+    assert measure_mp4_dimensions(_ftyp() + _box(b"moov", sub + real)) == (720, 1280)
+
+
+def test_stsd_fallback_respects_rotation_matrix_when_tkhd_size_is_zero() -> None:
+    trak = _trak_full(handler=b"vide", width=0, height=0, entry=(b"avc1", 1920, 1080), matrix=_ROT90)
+    assert measure_mp4_dimensions(_ftyp() + _box(b"moov", trak)) == (1080, 1920)
+
+
+def test_unknown_tkhd_version_is_rejected() -> None:
+    bad = bytearray(build_mp4(720, 1280))
+    idx = bytes(bad).index(b"tkhd") + 4
+    bad[idx] = 2
+    assert measure_mp4_dimensions(bytes(bad)) is None
