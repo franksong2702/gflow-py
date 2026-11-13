@@ -37,6 +37,7 @@ from ..types import MediaItem
 from ._errors import structured_tool
 from ._filelink import DEFAULT_UPLOAD_TTL_SECONDS, FileTransferConfig
 from ._jobs import JobStore
+from ._ssrf import ImageFetchError, fetch_public_image
 from ._pathguard import resolve_confined_output
 
 __all__ = [
@@ -644,7 +645,7 @@ def create_server(
 
         Supply exactly ONE of:
         - `image_base64`: Remote-friendly inline base64 data (raw base64 or `data:image/...;base64,...`, max 15 MiB decoded).
-        - `image_url`: HTTP/HTTPS image URL reachable by the server (max 20 MiB / 20,971,520 bytes).
+        - `image_url`: HTTP/HTTPS image URL reachable by the server (max 20 MiB / 20,971,520 bytes). On public HTTP deployments only `https://` URLs on public hosts are accepted.
         - `file_path`: Server-local filesystem path (for local M15 / stdio callers, max 20 MiB).
 
         The returned `media_id` can be passed directly to `flow_generate_video(start_frame_media_id=..., end_frame_media_id=..., reference_media_ids=[...])` or `flow_generate_image`.
@@ -683,15 +684,24 @@ def create_server(
 
         if image_url is not None and image_url.strip():
             u = image_url.strip()
-            if not (u.startswith("https://") or u.startswith("http://")):
-                raise ValidationError("image_url must start with http:// or https://.")
-            try:
-                async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
-                    resp = await http.get(u)
-                    resp.raise_for_status()
-                    raw_bytes = resp.content
-            except httpx.HTTPError as exc:
-                raise ValidationError(f"Could not fetch image_url {u!r}: {exc}") from exc
+            if restricted:
+                # Public HTTP mode: `image_url` is untrusted input. Use the SSRF-hardened fetcher
+                # (https only, public addresses only, pinned IP, manually re-validated redirects,
+                # streamed size cap, generic errors that never echo the URL or upstream details).
+                try:
+                    raw_bytes = await fetch_public_image(u, max_bytes=MAX_URL_FETCH_IMAGE_BYTES)
+                except ImageFetchError as exc:
+                    raise ValidationError(str(exc)) from None
+            else:
+                if not (u.startswith("https://") or u.startswith("http://")):
+                    raise ValidationError("image_url must start with http:// or https://.")
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
+                        resp = await http.get(u)
+                        resp.raise_for_status()
+                        raw_bytes = resp.content
+                except httpx.HTTPError as exc:
+                    raise ValidationError(f"Could not fetch image_url {u!r}: {exc}") from exc
             detected_mime, clean_name = _detect_and_validate_image_bytes(
                 raw_bytes,
                 file_name=file_name,
