@@ -6,7 +6,9 @@ import asyncio
 import base64
 import binascii
 from datetime import datetime, timezone
+import functools
 import hashlib
+import inspect
 import json
 import mimetypes
 import time
@@ -35,6 +37,7 @@ from ..types import MediaItem
 from ._errors import structured_tool
 from ._filelink import DEFAULT_UPLOAD_TTL_SECONDS, FileTransferConfig
 from ._jobs import JobStore
+from ._pathguard import resolve_confined_output
 
 __all__ = [
     "MAX_INLINE_IMAGE_BYTES",
@@ -48,6 +51,13 @@ MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MiB decoded bytes for inline JSO
 MAX_URL_FETCH_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB (`20,971,520` bytes) exact Google Flow image cap
 DEFAULT_SOFT_WAIT_SECONDS = 25.0
 MAX_SOFT_WAIT_SECONDS = 35.0  # Stay safely under 45s remote client HTTP timeout
+
+_FILE_PATH_DISABLED = (
+    "file_path is disabled on the remote HTTP transport; use image_base64 or flow_create_upload_link."
+)
+_PROFILE_SWITCH_DISABLED = (
+    "Switching profile is disabled on the remote HTTP transport; omit profile to use the server active profile."
+)
 
 
 def _params_fingerprint(params: dict[str, Any] | None) -> str | None:
@@ -290,8 +300,13 @@ def create_server(
     file_transfer: FileTransferConfig | None = None,
     job_store: JobStore | None = None,
     keepalive_interval: float | None = None,
+    restricted: bool = False,
 ) -> FastMCP:
-    """Construct the ``gflow`` FastMCP server with all Google Flow tools registered."""
+    """Construct the ``gflow`` FastMCP server with all Google Flow tools registered.
+
+    ``restricted=True`` (used by the public HTTP transport) confines ``output_path`` writes to the
+    exports directory, disables server-local ``file_path`` reads, and forbids switching ``profile``.
+    """
     resolved_profile = get_active_profile(profile)
     default_keepalive = (
         DEFAULT_KEEPALIVE_INTERVAL_SECONDS if client_factory is None else 0.0
@@ -394,6 +409,25 @@ def create_server(
 
     # ── 0. Connector Documentation Resources (`gflow://docs/...`) ────────────
 
+    def _confine_output_path(fn: Callable[..., Any]) -> Callable[..., Any]:
+        """In restricted mode, force ``output_path`` to resolve inside the exports directory before the tool runs."""
+        if not restricted:
+            return fn
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            bound = sig.bind_partial(*args, **kwargs)
+            raw = bound.arguments.get("output_path")
+            if raw is not None:
+                from . import _fileroutes
+
+                safe = resolve_confined_output(raw, _fileroutes.get_exports_dir())
+                bound.arguments["output_path"] = str(safe)
+            return await fn(*bound.args, **bound.kwargs)
+
+        return wrapper
+
     @mcp.resource("gflow://docs/connector")
     def connector_reference_doc() -> str:
         """Canonical Google Flow MCP `CONNECTOR.md` with verified limits, concurrency caps, TTLs, auto-renewal, and full error table."""
@@ -422,6 +456,8 @@ def create_server(
         disrupting the active `default` session.
         """
         target_profile = (profile or "").strip() or resolved_profile
+        if restricted and target_profile != resolved_profile:
+            raise ValidationError(_PROFILE_SWITCH_DISABLED)
         if target_profile != resolved_profile:
             async with FlowClient.from_storage(profile=target_profile) as temp_client:
                 user, credits = await asyncio.gather(
@@ -489,6 +525,8 @@ def create_server(
         if limit < 1:
             raise ValidationError("limit must be >= 1.")
         target_profile = (profile or "").strip() or resolved_profile
+        if restricted and target_profile != resolved_profile:
+            raise ValidationError(_PROFILE_SWITCH_DISABLED)
         if target_profile != resolved_profile:
             async with FlowClient.from_storage(profile=target_profile) as temp_client:
                 projects = await temp_client.list_projects(limit=limit)
@@ -669,6 +707,8 @@ def create_server(
             return _serialize_media(item, file_transfer)
 
         assert file_path is not None
+        if restricted:
+            raise ValidationError(_FILE_PATH_DISABLED)
         local = Path(file_path).expanduser()
         if not local.is_file():
             raise NotFoundError(f"Local image file does not exist on server: {local}")
@@ -741,6 +781,7 @@ def create_server(
 
     @mcp.tool()
     @structured_tool
+    @_confine_output_path
     async def flow_get_media(
         media_id: str,
         include_checksum: bool = False,
@@ -1192,6 +1233,7 @@ def create_server(
 
     @mcp.tool()
     @structured_tool
+    @_confine_output_path
     async def flow_scene_export_mp4(
         scene_id: str,
         output_path: str | None = None,
