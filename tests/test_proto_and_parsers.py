@@ -275,14 +275,15 @@ def test_aspect_ratio_wire_encoding_and_video_dimensions() -> None:
     # 3. Verify 9:16 (`aspect_code == 1`) & 16:9 (`aspect_code == 2`) across ALL 7 video modes
     _, req_t2v_p, _ = build_generate_video_req("p1", "puppy", model="omni", duration_seconds=4, aspect_ratio="9:16")
     _, req_t2v_l, _ = build_generate_video_req("p1", "puppy", model="omni", duration_seconds=4, aspect_ratio="16:9")
-    assert req_t2v_p[0][0][1] == "macaron_cookie_t2v_4s"
+    assert req_t2v_p[0][0][1] == "macaron_cookie_t2v_4s_portrait"
+    assert req_t2v_l[0][0][1] == "macaron_cookie_t2v_4s"  # landscape keeps the bare key
     assert req_t2v_p[0][0][2] == 1  # field 3 == 1 (PORTRAIT)
     assert req_t2v_l[0][0][2] == 2  # field 3 == 2 (LANDSCAPE)
 
     _, req_i2v_p, _ = build_generate_video_req(
         "p1", "puppy", model="omni", duration_seconds=4, aspect_ratio="9:16", start_frame_media_id="f1"
     )
-    assert req_i2v_p[0][0][1] == "macaron_cookie_i2v_4s"
+    assert req_i2v_p[0][0][1] == "macaron_cookie_i2v_4s_portrait"
     assert req_i2v_p[0][0][2] == 1  # field 3 == 1
 
     _, req_fl_p, _ = build_generate_video_req(
@@ -333,6 +334,7 @@ def test_aspect_ratio_wire_encoding_and_video_dimensions() -> None:
     p_item = parse_media_item(portrait_entry)
     assert p_item is not None
     assert (p_item.width, p_item.height) == (720, 1280)
+    assert p_item.dimensions_source == "inferred_from_aspect"
 
     landscape_entry = jspb_msg(
         {
@@ -355,4 +357,5 @@ def test_aspect_ratio_wire_encoding_and_video_dimensions() -> None:
     l_item = parse_media_item(landscape_entry)
     assert l_item is not None
     assert (l_item.width, l_item.height) == (1280, 720)
+    assert l_item.dimensions_source == "inferred_from_aspect"
 

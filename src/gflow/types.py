@@ -95,6 +95,9 @@ class MediaItem:
     thumbnail_url: str | None = None
     created_at_epoch: int | None = None
     error_message: str | None = None
+    # Provenance of width/height: "reported" (present in Flow response), "inferred_from_aspect"
+    # (derived from aspect-ratio/resolution enum codes, NOT measured), "measured_mp4" (probed from bytes).
+    dimensions_source: str | None = None
 
     @property
     def download_url(self) -> str | None:

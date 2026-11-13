@@ -168,6 +168,7 @@ def main(argv: list[str] | None = None) -> None:
             profile=args.profile,
             auth=build_auth(token, oauth_provider),
             file_transfer=file_transfer,
+            restricted=True,
         )
 
         has_auth = token is not None or oauth_config is not None

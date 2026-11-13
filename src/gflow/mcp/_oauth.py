@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ from mcp.server.auth.provider import (
 )
 from mcp.server.auth.settings import ClientRegistrationOptions
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyUrl, TypeAdapter
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
@@ -41,7 +43,9 @@ from ._host_guard import validate_bare_https_origin
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_ALLOWED_REDIRECT_URIS",
     "MIN_PASSWORD_LEN",
+    "OAUTH_ALLOWED_REDIRECTS_ENV",
     "OAUTH_BASE_URL_ENV",
     "OAUTH_PASSWORD_ENV",
     "OAUTH_STATE_PATH_ENV",
@@ -56,6 +60,12 @@ OAUTH_PASSWORD_ENV = "GFLOW_MCP_OAUTH_PASSWORD"
 OAUTH_BASE_URL_ENV = "GFLOW_MCP_OAUTH_BASE_URL"
 OAUTH_STATE_PATH_ENV = "GFLOW_MCP_OAUTH_STATE_PATH"
 TRUST_PROXY_ENV = "GFLOW_MCP_TRUST_PROXY"
+OAUTH_ALLOWED_REDIRECTS_ENV = "GFLOW_MCP_OAUTH_ALLOWED_REDIRECTS"
+
+DEFAULT_ALLOWED_REDIRECT_URIS: tuple[str, ...] = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
 
 MIN_PASSWORD_LEN = 16
 MAX_CLIENTS = 100
@@ -65,6 +75,73 @@ MAX_LOGIN_ATTEMPTS = 3
 THROTTLE_WINDOW_SECONDS = 60
 THROTTLE_MAX_FAILURES = 5
 MAX_THROTTLE_IPS = 2048
+
+_ANY_URL_ADAPTER: TypeAdapter[AnyUrl] = TypeAdapter(AnyUrl)
+
+
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_acceptable_extra_redirect(uri: str) -> bool:
+    """Extra (env-supplied) redirect URIs must be https, or http on a loopback host."""
+    if any(c.isspace() for c in uri):
+        return False
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        return False
+    if parts.fragment or parts.username is not None or parts.password is not None:
+        return False
+    if parts.scheme == "https":
+        return bool(parts.hostname)
+    if parts.scheme == "http":
+        return _is_loopback_host(parts.hostname)
+    return False
+
+
+def _normalize_redirect_uri(uri: str) -> str:
+    try:
+        return str(_ANY_URL_ADAPTER.validate_python(uri))
+    except (ValueError, TypeError):
+        return uri
+
+
+def _env_allowed_redirect_uris() -> tuple[str, ...]:
+    raw = os.environ.get(OAUTH_ALLOWED_REDIRECTS_ENV, "")
+    out: list[str] = []
+    for item in raw.split(","):
+        uri = item.strip()
+        if not uri:
+            continue
+        if not _is_acceptable_extra_redirect(uri):
+            logger.warning(
+                "Ignoring %s entry %r: only https or loopback http URIs are accepted",
+                OAUTH_ALLOWED_REDIRECTS_ENV,
+                uri,
+            )
+            continue
+        out.append(uri)
+    return tuple(out)
+
+
+def _resolve_allowed_redirect_uris(explicit: tuple[str, ...] | None) -> frozenset[str]:
+    if explicit is None:
+        base: tuple[str, ...] = (*DEFAULT_ALLOWED_REDIRECT_URIS, *_env_allowed_redirect_uris())
+    else:
+        base = tuple(explicit)
+    allowed: set[str] = set()
+    for uri in base:
+        allowed.add(uri)
+        allowed.add(_normalize_redirect_uri(uri))
+    return frozenset(allowed)
 
 
 class _Pending(NamedTuple):
@@ -149,6 +226,7 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
         base_url: str,
         state_path: Path | None = None,
         trust_proxy: bool = False,
+        allowed_redirect_uris: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(
             base_url=base_url,
@@ -163,6 +241,9 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
         self._pending: dict[str, _Pending] = {}
         self._fail_times: dict[str, list[float]] = {}
         self._refresh_resources: dict[str, str] = {}
+        self._allowed_redirect_uris: frozenset[str] = _resolve_allowed_redirect_uris(
+            allowed_redirect_uris
+        )
         self._load_state()
 
     def _kdf(self, password: str) -> bytes:
@@ -176,7 +257,24 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
             maxmem=64 * 1024 * 1024,
         )
 
+    def _redirect_uri_allowed(self, uri: str) -> bool:
+        return (
+            uri in self._allowed_redirect_uris
+            or _normalize_redirect_uri(uri) in self._allowed_redirect_uris
+        )
+
+    def _client_redirects_allowed(self, client_info: OAuthClientInformationFull) -> bool:
+        uris = client_info.redirect_uris
+        if not uris:
+            return False
+        return all(self._redirect_uri_allowed(str(u)) for u in uris)
+
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        if not self._client_redirects_allowed(client_info):
+            raise RegistrationError(
+                error="invalid_redirect_uri",
+                error_description="redirect_uri is not allowed.",
+            )
         if client_info.client_id not in self.clients and len(self.clients) >= MAX_CLIENTS:
             used = {t.client_id for t in self.access_tokens.values()}
             used |= {t.client_id for t in self.refresh_tokens.values()}
@@ -195,6 +293,16 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
         client: OAuthClientInformationFull,
         params: AuthorizationParams,
     ) -> str:
+        registered = {str(u) for u in (client.redirect_uris or [])}
+        if (
+            params.redirect_uri is None
+            or not self._redirect_uri_allowed(str(params.redirect_uri))
+            or str(params.redirect_uri) not in registered
+        ):
+            raise AuthorizeError(
+                error="invalid_request",
+                error_description="redirect_uri is not allowed.",
+            )
         expected_resource = self._expected_resource()
         allowed_resources = {
             expected_resource,
@@ -465,6 +573,23 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("Ignoring unreadable OAuth state %s: %s", self._state_path, exc)
             return
+        dropped = {
+            cid for cid, info in clients.items() if not self._client_redirects_allowed(info)
+        }
+        if dropped:
+            logger.warning(
+                "Dropping %d persisted OAuth client(s) with non-allowlisted redirect_uri",
+                len(dropped),
+            )
+            clients = {k: v for k, v in clients.items() if k not in dropped}
+            access_tokens = {
+                k: v for k, v in access_tokens.items() if v.client_id not in dropped
+            }
+            refresh_tokens = {
+                k: v for k, v in refresh_tokens.items() if v.client_id not in dropped
+            }
+            a2r = {a: r for a, r in a2r.items() if a in access_tokens}
+            r2a = {r: a for r, a in r2a.items() if r in refresh_tokens}
         self.clients = clients
         self.access_tokens = access_tokens
         self.refresh_tokens = refresh_tokens

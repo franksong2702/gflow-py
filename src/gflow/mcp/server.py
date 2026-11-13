@@ -6,8 +6,12 @@ import asyncio
 import base64
 import binascii
 from datetime import datetime, timezone
+import functools
 import hashlib
+import inspect
+import json
 import mimetypes
+import shutil
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -28,11 +32,14 @@ from .._proto import (
 from ..auth import DEFAULT_KEEPALIVE_INTERVAL_SECONDS
 from ..client import FlowClient
 from ..exceptions import NotFoundError, ValidationError
+from ..media_probe import measure_mp4_dimensions
 from ..paths import get_active_profile, load_context, save_context
 from ..types import MediaItem
 from ._errors import structured_tool
 from ._filelink import DEFAULT_UPLOAD_TTL_SECONDS, FileTransferConfig
 from ._jobs import JobStore
+from ._ssrf import ImageFetchError, fetch_public_image
+from ._pathguard import resolve_confined_output
 
 __all__ = [
     "MAX_INLINE_IMAGE_BYTES",
@@ -46,6 +53,50 @@ MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MiB decoded bytes for inline JSO
 MAX_URL_FETCH_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB (`20,971,520` bytes) exact Google Flow image cap
 DEFAULT_SOFT_WAIT_SECONDS = 25.0
 MAX_SOFT_WAIT_SECONDS = 35.0  # Stay safely under 45s remote client HTTP timeout
+
+_FILE_PATH_DISABLED = (
+    "file_path is disabled on the remote HTTP transport; use image_base64 or flow_create_upload_link."
+)
+_PROFILE_SWITCH_DISABLED = (
+    "Switching profile is disabled on the remote HTTP transport; omit profile to use the server active profile."
+)
+
+
+def _norm_param(value: Any) -> Any:
+    """Canonicalise a parameter for fingerprinting: strings are stripped + lower-cased (enum-like values)."""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (list, tuple)):
+        return [_norm_param(v) for v in value]
+    return value
+
+
+_FREE_TEXT_PARAMS = frozenset({"prompt", "scene_id", "video_media_id", "start_frame_media_id",
+                               "end_frame_media_id", "base_image_media_id", "reference_media_ids",
+                               "project_id", "output_path"})
+
+
+def _params_fingerprint(params: dict[str, Any] | None) -> str | None:
+    """Stable SHA-256 of the output-affecting tool parameters (``None`` when no params are supplied).
+
+    Used so that reusing an ``idempotency_key`` with changed parameters (e.g. 16:9 -> 9:16) is rejected
+    instead of silently replaying the old job. Enum-like values (model / aspect / resolution / target)
+    are normalised so a retry that differs only by case or whitespace is still a replay; ids and prompt
+    text are only stripped, never case-folded.
+    """
+    if params is None:
+        return None
+    canon: dict[str, Any] = {}
+    for k, v in params.items():
+        if k in _FREE_TEXT_PARAMS:
+            canon[k] = [x.strip() if isinstance(x, str) else x for x in v] if isinstance(v, list) else (
+                v.strip() if isinstance(v, str) else v
+            )
+        else:
+            canon[k] = _norm_param(v)
+    blob = json.dumps(canon, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 
 SERVER_INSTRUCTIONS = (
     "Drive Google Flow (flow.google.com) over MCP.\n"
@@ -275,8 +326,13 @@ def create_server(
     file_transfer: FileTransferConfig | None = None,
     job_store: JobStore | None = None,
     keepalive_interval: float | None = None,
+    restricted: bool = False,
 ) -> FastMCP:
-    """Construct the ``gflow`` FastMCP server with all Google Flow tools registered."""
+    """Construct the ``gflow`` FastMCP server with all Google Flow tools registered.
+
+    ``restricted=True`` (used by the public HTTP transport) confines ``output_path`` writes to the
+    exports directory, disables server-local ``file_path`` reads, and forbids switching ``profile``.
+    """
     resolved_profile = get_active_profile(profile)
     default_keepalive = (
         DEFAULT_KEEPALIVE_INTERVAL_SECONDS if client_factory is None else 0.0
@@ -332,6 +388,20 @@ def create_server(
         all_done = bool(items) and all(bool(it.download_url) for it in items)
         return ("completed" if all_done else "running"), items
 
+    def _with_effective_project(params: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Replace an omitted ``project_id`` with the profile's active project so the idempotency
+        fingerprint reflects the project the job will really target."""
+        if params is None or "project_id" not in params:
+            return params
+        pid = params.get("project_id")
+        if isinstance(pid, str) and pid.strip():
+            return params
+        try:
+            active = load_context(resolved_profile).get("project_id")
+        except Exception:
+            active = None
+        return {**params, "project_id": active}
+
     async def _run_media_generation_job(
         *,
         op: str,
@@ -339,6 +409,7 @@ def create_server(
         wait: bool,
         wait_timeout_seconds: float,
         submit_coro_fn: Callable[[FlowClient], Any],
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         client = await manager.get()
 
@@ -356,6 +427,7 @@ def create_server(
             op=op,
             idempotency_key=idempotency_key,
             submit_fn=_submit,
+            params_fingerprint=_params_fingerprint(_with_effective_project(params)),
         )
         media_ids: list[str] = list(record.get("media_ids") or [])
         status, items = await _poll_soft(
@@ -376,6 +448,25 @@ def create_server(
         }
 
     # ── 0. Connector Documentation Resources (`gflow://docs/...`) ────────────
+
+    def _confine_output_path(fn: Callable[..., Any]) -> Callable[..., Any]:
+        """In restricted mode, force ``output_path`` to resolve inside the exports directory before the tool runs."""
+        if not restricted:
+            return fn
+        sig = inspect.signature(fn)
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            bound = sig.bind_partial(*args, **kwargs)
+            raw = bound.arguments.get("output_path")
+            if raw is not None:
+                from . import _fileroutes
+
+                safe = resolve_confined_output(raw, _fileroutes.get_exports_dir())
+                bound.arguments["output_path"] = str(safe)
+            return await fn(*bound.args, **bound.kwargs)
+
+        return wrapper
 
     @mcp.resource("gflow://docs/connector")
     def connector_reference_doc() -> str:
@@ -405,6 +496,8 @@ def create_server(
         disrupting the active `default` session.
         """
         target_profile = (profile or "").strip() or resolved_profile
+        if restricted and target_profile != resolved_profile:
+            raise ValidationError(_PROFILE_SWITCH_DISABLED)
         if target_profile != resolved_profile:
             async with FlowClient.from_storage(profile=target_profile) as temp_client:
                 user, credits = await asyncio.gather(
@@ -472,6 +565,8 @@ def create_server(
         if limit < 1:
             raise ValidationError("limit must be >= 1.")
         target_profile = (profile or "").strip() or resolved_profile
+        if restricted and target_profile != resolved_profile:
+            raise ValidationError(_PROFILE_SWITCH_DISABLED)
         if target_profile != resolved_profile:
             async with FlowClient.from_storage(profile=target_profile) as temp_client:
                 projects = await temp_client.list_projects(limit=limit)
@@ -589,7 +684,7 @@ def create_server(
 
         Supply exactly ONE of:
         - `image_base64`: Remote-friendly inline base64 data (raw base64 or `data:image/...;base64,...`, max 15 MiB decoded).
-        - `image_url`: HTTP/HTTPS image URL reachable by the server (max 20 MiB / 20,971,520 bytes).
+        - `image_url`: HTTP/HTTPS image URL reachable by the server (max 20 MiB / 20,971,520 bytes). On public HTTP deployments only `https://` URLs on public hosts are accepted.
         - `file_path`: Server-local filesystem path (for local M15 / stdio callers, max 20 MiB).
 
         The returned `media_id` can be passed directly to `flow_generate_video(start_frame_media_id=..., end_frame_media_id=..., reference_media_ids=[...])` or `flow_generate_image`.
@@ -628,15 +723,24 @@ def create_server(
 
         if image_url is not None and image_url.strip():
             u = image_url.strip()
-            if not (u.startswith("https://") or u.startswith("http://")):
-                raise ValidationError("image_url must start with http:// or https://.")
-            try:
-                async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
-                    resp = await http.get(u)
-                    resp.raise_for_status()
-                    raw_bytes = resp.content
-            except httpx.HTTPError as exc:
-                raise ValidationError(f"Could not fetch image_url {u!r}: {exc}") from exc
+            if restricted:
+                # Public HTTP mode: `image_url` is untrusted input. Use the SSRF-hardened fetcher
+                # (https only, public addresses only, pinned IP, manually re-validated redirects,
+                # streamed size cap, generic errors that never echo the URL or upstream details).
+                try:
+                    raw_bytes = await fetch_public_image(u, max_bytes=MAX_URL_FETCH_IMAGE_BYTES)
+                except ImageFetchError as exc:
+                    raise ValidationError(str(exc)) from None
+            else:
+                if not (u.startswith("https://") or u.startswith("http://")):
+                    raise ValidationError("image_url must start with http:// or https://.")
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as http:
+                        resp = await http.get(u)
+                        resp.raise_for_status()
+                        raw_bytes = resp.content
+                except httpx.HTTPError as exc:
+                    raise ValidationError(f"Could not fetch image_url {u!r}: {exc}") from exc
             detected_mime, clean_name = _detect_and_validate_image_bytes(
                 raw_bytes,
                 file_name=file_name,
@@ -652,6 +756,8 @@ def create_server(
             return _serialize_media(item, file_transfer)
 
         assert file_path is not None
+        if restricted:
+            raise ValidationError(_FILE_PATH_DISABLED)
         local = Path(file_path).expanduser()
         if not local.is_file():
             raise NotFoundError(f"Local image file does not exist on server: {local}")
@@ -724,25 +830,60 @@ def create_server(
 
     @mcp.tool()
     @structured_tool
+    @_confine_output_path
     async def flow_get_media(
         media_id: str,
         include_checksum: bool = False,
         output_path: str | None = None,
+        verify_dimensions: bool = False,
     ) -> dict[str, Any]:
         """Fetch full metadata + 24h signed `download_link` for a `media_id`.
 
         Set `include_checksum=True` to also return exact `file_size_bytes` and `sha256` from the server.
+        Metadata `width`/`height` may be inferred from the aspect-ratio code
+        (`dimensions_source='inferred_from_aspect'`). Set `verify_dimensions=True` (implied by
+        `include_checksum=True`) to download the MP4 and measure the real frame size from its `tkhd` box:
+        returns `measured_width`, `measured_height`, `dimensions_source='measured_mp4'` and
+        `dimension_mismatch=True` when the measured size differs from the metadata.
         """
         client = await manager.get()
         item = await client.get_media(media_id)
         data = _serialize_media(item, file_transfer)
-        if include_checksum and item.download_url:
-            raw_bytes, _ = await client._rpc.download_bytes(item.download_url)
-            data["file_size_bytes"] = len(raw_bytes)
-            data["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+        data.setdefault("dimensions_source", getattr(item, "dimensions_source", None))
+        is_video = item.media_type == "video" or (item.mime_type or "").startswith("video/")
+        want_probe = is_video and (include_checksum or verify_dimensions)
+        raw_bytes: bytes | None = None
         if output_path is not None:
+            # Download once to disk, then checksum/probe the saved file (no second download).
             saved = await client.download_media(item, output_path=output_path)
             data["saved_path"] = str(saved)
+            if include_checksum or want_probe:
+                raw_bytes = saved.read_bytes()
+        elif (include_checksum or want_probe) and item.download_url:
+            raw_bytes, _ = await client._rpc.download_bytes(item.download_url)
+        if include_checksum and raw_bytes is not None:
+            data["file_size_bytes"] = len(raw_bytes)
+            data["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+        if want_probe:
+            measured = measure_mp4_dimensions(raw_bytes) if raw_bytes is not None else None
+            if measured is not None:
+                m_w, m_h = measured
+                data["measured_width"] = m_w
+                data["measured_height"] = m_h
+                data["dimensions_source"] = "measured_mp4"
+                data["width"] = m_w
+                data["height"] = m_h
+                if item.width is not None and item.height is not None:
+                    mismatch = (item.width, item.height) != (m_w, m_h)
+                    data["dimension_mismatch"] = mismatch
+                    if mismatch:
+                        data["metadata_width"] = item.width
+                        data["metadata_height"] = item.height
+                        data["metadata_dimensions_source"] = getattr(item, "dimensions_source", None)
+                else:
+                    data["dimension_mismatch"] = None
+            elif verify_dimensions:
+                data["dimension_probe_failed"] = True
         return data
 
     @mcp.tool()
@@ -817,6 +958,16 @@ def create_server(
 
         return await _run_media_generation_job(
             op="generate_image",
+            params={
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "count": count,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+                "base_image_media_id": base_image_media_id,
+                "seed": seed,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -892,6 +1043,20 @@ def create_server(
 
         return await _run_media_generation_job(
             op="generate_video",
+            params={
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "duration_seconds": duration_seconds,
+                "count": count,
+                "start_frame_media_id": start_frame_media_id,
+                "end_frame_media_id": end_frame_media_id,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+                "scene_id": scene_id,
+                "seed": seed,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -939,6 +1104,15 @@ def create_server(
 
         return await _run_media_generation_job(
             op="extend_video",
+            params={
+                "video_media_id": video_media_id,
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -976,6 +1150,12 @@ def create_server(
 
         return await _run_media_generation_job(
             op="upsample_video",
+            params={
+                "video_media_id": video_media_id,
+                "target": target,
+                "aspect_ratio": aspect_ratio,
+                "project_id": project_id,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -1109,6 +1289,7 @@ def create_server(
 
     @mcp.tool()
     @structured_tool
+    @_confine_output_path
     async def flow_scene_export_mp4(
         scene_id: str,
         output_path: str | None = None,
@@ -1142,9 +1323,10 @@ def create_server(
                     custom_dest = custom_dest / export_fname
                 custom_dest.parent.mkdir(parents=True, exist_ok=True)
                 if custom_dest.resolve() != saved.resolve():
-                    custom_dest.write_bytes(saved.read_bytes())
+                    shutil.copyfile(saved, custom_dest)
 
             size_bytes, sha_hex = compute_file_checksum(saved)
+            measured = measure_mp4_dimensions(saved.read_bytes())
             return {
                 "kind": "scene_export",
                 "status": "completed",
@@ -1154,12 +1336,20 @@ def create_server(
                 "upstream_mp4_url": upstream_url,
                 "file_size_bytes": size_bytes,
                 "sha256": sha_hex,
+                "dimensions_source": "measured_mp4" if measured else None,
+                "measured_width": measured[0] if measured else None,
+                "measured_height": measured[1] if measured else None,
             }
 
         record, replayed = await jobs.submit_or_reuse(
             op="scene_export",
             idempotency_key=idempotency_key,
             submit_fn=_do_export,
+            params_fingerprint=_params_fingerprint(
+                _with_effective_project(
+                    {"scene_id": scene_id.strip(), "project_id": project_id, "output_path": output_path}
+                )
+            ),
         )
         result = {
             **record,
