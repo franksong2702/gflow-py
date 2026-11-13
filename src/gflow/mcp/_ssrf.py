@@ -159,7 +159,7 @@ async def _default_resolver(host: str, port: int) -> list[str]:
 @dataclass(frozen=True)
 class _Target:
     original: httpx.URL
-    request_url: httpx.URL
+    request_urls: tuple[httpx.URL, ...]
     headers: dict[str, str]
     extensions: dict[str, Any] = field(default_factory=dict)
 
@@ -193,7 +193,9 @@ async def _prepare_target(url: Union[str, httpx.URL], resolver: Resolver) -> _Ta
         host = parsed.raw_host.decode("ascii")
     except UnicodeDecodeError:
         raise ImageFetchError("invalid_url") from None
-    port = parsed.port or _DEFAULT_HTTPS_PORT
+    if parsed.port == 0:
+        raise ImageFetchError("invalid_url")
+    port = _DEFAULT_HTTPS_PORT if parsed.port is None else parsed.port
 
     literal: Optional[_IPAddress]
     try:
@@ -211,20 +213,31 @@ async def _prepare_target(url: Union[str, httpx.URL], resolver: Resolver) -> _Ta
         except ImageFetchError:
             raise
         except Exception:
-            raise ImageFetchError("dns_error") from None
+            # Same externally visible category as a blocked address, so callers cannot tell
+            # "internal name that resolves" from "name that does not resolve" (internal DNS probing).
+            raise ImageFetchError("blocked_address") from None
         if not addresses:
-            raise ImageFetchError("dns_error")
+            raise ImageFetchError("blocked_address")
 
     # Every resolved address must be public. Otherwise an attacker could mix one public and one
     # internal record and rely on connection-time address selection.
     if not all(is_public_ip(addr) for addr in addresses):
         raise ImageFetchError("blocked_address")
 
-    pinned = addresses[0]
-    ip_netloc = f"[{pinned.compressed}]" if pinned.version == 6 else pinned.compressed
+    # Pin the connection to already-validated addresses (ordered, de-duplicated). Connection-level
+    # failures fall through to the next validated address; nothing is ever re-resolved.
+    unique: list[_IPAddress] = []
+    for addr in addresses:
+        if addr not in unique:
+            unique.append(addr)
     try:
         path_and_query = parsed.raw_path.decode("ascii") or "/"
-        request_url = httpx.URL(f"https://{ip_netloc}:{port}{path_and_query}")
+        request_urls = tuple(
+            httpx.URL(
+                f"https://{'[' + a.compressed + ']' if a.version == 6 else a.compressed}:{port}{path_and_query}"
+            )
+            for a in unique[:4]
+        )
     except (httpx.InvalidURL, UnicodeDecodeError, ValueError):
         raise ImageFetchError("invalid_url") from None
 
@@ -240,7 +253,7 @@ async def _prepare_target(url: Union[str, httpx.URL], resolver: Resolver) -> _Ta
     # the pinned IP. Not needed (and not valid as SNI) when the URL host is already an IP literal.
     extensions: dict[str, Any] = {} if literal is not None else {"sni_hostname": host}
     return _Target(
-        original=parsed, request_url=request_url, headers=headers, extensions=extensions
+        original=parsed, request_urls=request_urls, headers=headers, extensions=extensions
     )
 
 
@@ -252,6 +265,16 @@ def _redirect_target(base: httpx.URL, location: str) -> httpx.URL:
 
 
 async def _read_capped(response: httpx.Response, max_bytes: int) -> bytes:
+    encodings = [
+        e.strip().lower()
+        for v in response.headers.get_list("content-encoding")
+        for e in v.split(",")
+        if e.strip()
+    ]
+    if any(e != "identity" for e in encodings):
+        # We request identity; never let httpx run a decompressor on attacker-controlled bytes
+        # (decompression bombs would bypass the streamed size cap).
+        raise ImageFetchError("http_status")
     declared = response.headers.get("content-length")
     if declared is not None:
         try:
@@ -262,7 +285,10 @@ async def _read_capped(response: httpx.Response, max_bytes: int) -> bytes:
             raise ImageFetchError("too_large")
 
     buf = bytearray()
-    async for chunk in response.aiter_bytes():
+    # Real network responses are still streaming here: read the raw (never decoded) bytes. Pre-read
+    # responses (in-memory test transports) are already materialised and carry no content-encoding.
+    chunks = response.aiter_bytes() if response.is_stream_consumed else response.aiter_raw()
+    async for chunk in chunks:
         if len(buf) + len(chunk) > max_bytes:
             # Raising here exits `client.stream(...)`, which closes the connection right away.
             raise ImageFetchError("too_large")
@@ -294,24 +320,36 @@ async def _fetch(
         async with httpx.AsyncClient(**client_kwargs) as client:
             for hop in range(MAX_REDIRECTS + 1):
                 target = await _prepare_target(current, resolver)
-                async with client.stream(
-                    "GET",
-                    target.request_url,
-                    headers=target.headers,
-                    extensions=target.extensions,
-                ) as response:
-                    status = response.status_code
-                    if status in _REDIRECT_STATUSES:
-                        location = response.headers.get("location")
-                        if not location:
-                            raise ImageFetchError("http_status")
-                        if hop >= MAX_REDIRECTS:
-                            raise ImageFetchError("redirect_limit")
-                        current = _redirect_target(target.original, location)
+                redirected = False
+                last_exc: Optional[Exception] = None
+                for request_url in target.request_urls:
+                    try:
+                        async with client.stream(
+                            "GET",
+                            request_url,
+                            headers=target.headers,
+                            extensions=target.extensions,
+                        ) as response:
+                            status = response.status_code
+                            if status in _REDIRECT_STATUSES:
+                                location = response.headers.get("location")
+                                if not location:
+                                    raise ImageFetchError("http_status")
+                                if hop >= MAX_REDIRECTS:
+                                    raise ImageFetchError("redirect_limit")
+                                current = _redirect_target(target.original, location)
+                                redirected = True
+                                break
+                            if not 200 <= status < 300:
+                                raise ImageFetchError("http_status")
+                            return await _read_capped(response, max_bytes)
+                    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                        last_exc = exc
                         continue
-                    if not 200 <= status < 300:
-                        raise ImageFetchError("http_status")
-                    return await _read_capped(response, max_bytes)
+                if redirected:
+                    continue
+                if last_exc is not None:
+                    raise last_exc
     except ImageFetchError:
         raise
     except httpx.TimeoutException:

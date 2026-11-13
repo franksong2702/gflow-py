@@ -176,11 +176,30 @@ def test_pathguard_relative_inside_root_allowed(tmp_path: Path) -> None:
     assert resolve_confined_output("clips/out.mp4", root) == root.resolve() / "clips" / "out.mp4"
 
 
-def test_pathguard_absolute_inside_root_allowed(tmp_path: Path) -> None:
+def test_pathguard_absolute_paths_rejected_even_inside_root(tmp_path: Path) -> None:
+    from gflow.exceptions import ValidationError
+
     root = tmp_path / "exports"
     root.mkdir()
-    target = root / "a.mp4"
-    assert resolve_confined_output(str(target), root) == root.resolve() / "a.mp4"
+    with pytest.raises(ValidationError):
+        resolve_confined_output(str(root / "a.mp4"), root)
+    assert resolve_confined_output("a.mp4", root) == root.resolve() / "a.mp4"
+
+
+def test_pathguard_escape_never_inspects_outside_symlinks(tmp_path: Path) -> None:
+    """Escapes get the same error whether or not the outside target exists / is a symlink."""
+    from gflow.exceptions import ValidationError
+
+    root = tmp_path / "exports"
+    root.mkdir()
+    outside_link = tmp_path / "link.mp4"
+    outside_link.symlink_to(tmp_path / "somewhere")
+    msgs = set()
+    for rel in ("../link.mp4", "../nope.mp4", "../../../../etc/passwd"):
+        with pytest.raises(ValidationError) as ei:
+            resolve_confined_output(rel, root)
+        msgs.add(str(ei.value))
+    assert len(msgs) == 1
 
 
 @pytest.mark.parametrize(

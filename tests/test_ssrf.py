@@ -141,8 +141,9 @@ async def test_internal_ip_literal_rejected_without_dns(url: str) -> None:
 
 
 async def test_resolver_failure_is_generic() -> None:
+    # Resolution failure is indistinguishable from a blocked address (no internal DNS probing).
     exc = await expect_failure(
-        "dns_error",
+        "blocked_address",
         "https://unknown.example.com/a.png",
         resolver=make_resolver({}),
         transport=never_called_transport(),
@@ -460,3 +461,47 @@ async def test_error_messages_never_contain_internal_addresses() -> None:
         assert message.startswith("image_url fetch failed: ")
         assert address not in message
         assert repr(address) not in repr(exc_info.value)
+
+
+async def test_content_encoding_rejected_before_any_decoding() -> None:
+    class _Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):  # real (not pre-read) streamed body
+            yield b"\x1f\x8b" + b"x" * 10
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_Stream(), headers={"content-encoding": "gzip, gzip"})
+
+    await expect_failure(
+        "http_status",
+        "https://img.example.com/a.png",
+        resolver=make_resolver({"img.example.com": ["93.184.216.34"]}),
+        transport=httpx.MockTransport(handler),
+    )
+
+
+async def test_port_zero_rejected() -> None:
+    await expect_failure(
+        "invalid_url",
+        "https://img.example.com:0/a.png",
+        resolver=make_resolver({"img.example.com": ["93.184.216.34"]}),
+        transport=never_called_transport(),
+    )
+
+
+async def test_falls_back_to_next_validated_address_on_connect_error() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.host)
+        if request.url.host == "93.184.216.34":
+            raise httpx.ConnectError("unreachable")
+        return httpx.Response(200, content=PNG_BYTES)
+
+    data = await fetch_public_image(
+        "https://img.example.com/a.png",
+        max_bytes=1024 * 1024,
+        resolver=make_resolver({"img.example.com": ["93.184.216.34", "93.184.216.35"]}),
+        transport=httpx.MockTransport(handler),
+    )
+    assert data == PNG_BYTES
+    assert seen == ["93.184.216.34", "93.184.216.35"]

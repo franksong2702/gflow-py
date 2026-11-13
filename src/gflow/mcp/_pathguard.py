@@ -21,7 +21,7 @@ def resolve_confined_output(output_path: str, root: Path) -> Path:
     """Resolve ``output_path`` and guarantee it stays inside ``root``.
 
     - Empty / whitespace-only strings and strings containing NUL are rejected.
-    - Relative paths are interpreted relative to ``root``; absolute paths must already lie inside ``root``.
+    - Only relative paths are accepted (interpreted relative to ``root``); absolute/anchored paths are rejected.
     - ``..`` components and symlinked directories are neutralised by resolving before the containment check.
     - The final path component must not itself be a symbolic link.
 
@@ -35,11 +35,18 @@ def resolve_confined_output(output_path: str, root: Path) -> Path:
     try:
         root_resolved = Path(root).resolve(strict=False)
         raw = Path(output_path)
-        candidate = raw if raw.is_absolute() else root_resolved / raw
+        if raw.is_absolute() or raw.anchor:
+            # Never accept absolute paths (even inside root): they would let a caller probe the real layout.
+            raise ValidationError(OUTSIDE_ROOT_MESSAGE)
+        candidate = root_resolved / raw
         name = candidate.name
         if name in ("", ".", ".."):
             raise ValidationError(OUTSIDE_ROOT_MESSAGE)
-        leaf = candidate.parent.resolve(strict=False) / name
+        parent_resolved = candidate.parent.resolve(strict=False)
+        # Containment first, symlink inspection second: nothing outside root is ever examined.
+        if parent_resolved != root_resolved and not parent_resolved.is_relative_to(root_resolved):
+            raise ValidationError(OUTSIDE_ROOT_MESSAGE)
+        leaf = parent_resolved / name
         if leaf.is_symlink():
             raise ValidationError(SYMLINK_TARGET_MESSAGE)
         resolved = leaf.resolve(strict=False)
