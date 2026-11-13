@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gflow-py"
+version = "0.1.0"
+description = "Unofficial Python SDK, CLI, and dual-mode MCP server (stdio + remote HTTP OAuth) for Google Flow (Veo 3.1, Omni 1.2, Nano Banana, Scene Builder)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Frank Song" }]
+dependencies = [
+    "click>=8.1.7",
+    "httpx>=0.27.0",
+    "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.48.0",
+]
+mcp = [
+    "fastmcp>=3.0.0",
+    "mcp>=1.20.0",
+    "starlette>=0.40.0",
+    "uvicorn>=0.30.0",
+]
+all = [
+    "gflow-py[browser,mcp]",
+]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/franksong2702/gflow-py"
+Repository = "https://github.com/franksong2702/gflow-py"
+Issues = "https://github.com/franksong2702/gflow-py/issues"
+
+[project.scripts]
+gflow = "gflow.cli.main:cli"
+gflow-mcp = "gflow.mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gflow"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
