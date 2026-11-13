@@ -7,6 +7,7 @@ import base64
 import binascii
 from datetime import datetime, timezone
 import hashlib
+import json
 import mimetypes
 import time
 from collections.abc import AsyncIterator, Callable
@@ -28,6 +29,7 @@ from .._proto import (
 from ..auth import DEFAULT_KEEPALIVE_INTERVAL_SECONDS
 from ..client import FlowClient
 from ..exceptions import NotFoundError, ValidationError
+from ..media_probe import measure_mp4_dimensions
 from ..paths import get_active_profile, load_context, save_context
 from ..types import MediaItem
 from ._errors import structured_tool
@@ -46,6 +48,19 @@ MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MiB decoded bytes for inline JSO
 MAX_URL_FETCH_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB (`20,971,520` bytes) exact Google Flow image cap
 DEFAULT_SOFT_WAIT_SECONDS = 25.0
 MAX_SOFT_WAIT_SECONDS = 35.0  # Stay safely under 45s remote client HTTP timeout
+
+
+def _params_fingerprint(params: dict[str, Any] | None) -> str | None:
+    """Stable SHA-256 of the output-affecting tool parameters (``None`` when no params are supplied).
+
+    Used so that reusing an ``idempotency_key`` with changed parameters (e.g. 16:9 -> 9:16) is rejected
+    instead of silently replaying the old job.
+    """
+    if params is None:
+        return None
+    blob = json.dumps(params, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 
 SERVER_INSTRUCTIONS = (
     "Drive Google Flow (flow.google.com) over MCP.\n"
@@ -339,6 +354,7 @@ def create_server(
         wait: bool,
         wait_timeout_seconds: float,
         submit_coro_fn: Callable[[FlowClient], Any],
+        params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         client = await manager.get()
 
@@ -356,6 +372,7 @@ def create_server(
             op=op,
             idempotency_key=idempotency_key,
             submit_fn=_submit,
+            params_fingerprint=_params_fingerprint(params),
         )
         media_ids: list[str] = list(record.get("media_ids") or [])
         status, items = await _poll_soft(
@@ -728,18 +745,45 @@ def create_server(
         media_id: str,
         include_checksum: bool = False,
         output_path: str | None = None,
+        verify_dimensions: bool = False,
     ) -> dict[str, Any]:
         """Fetch full metadata + 24h signed `download_link` for a `media_id`.
 
         Set `include_checksum=True` to also return exact `file_size_bytes` and `sha256` from the server.
+        Metadata `width`/`height` may be inferred from the aspect-ratio code
+        (`dimensions_source='inferred_from_aspect'`). Set `verify_dimensions=True` (implied by
+        `include_checksum=True`) to download the MP4 and measure the real frame size from its `tkhd` box:
+        returns `measured_width`, `measured_height`, `dimensions_source='measured_mp4'` and
+        `dimension_mismatch=True` when the measured size differs from the metadata.
         """
         client = await manager.get()
         item = await client.get_media(media_id)
         data = _serialize_media(item, file_transfer)
-        if include_checksum and item.download_url:
+        data.setdefault("dimensions_source", getattr(item, "dimensions_source", None))
+        raw_bytes: bytes | None = None
+        if (include_checksum or verify_dimensions) and item.download_url:
             raw_bytes, _ = await client._rpc.download_bytes(item.download_url)
+        if include_checksum and raw_bytes is not None:
             data["file_size_bytes"] = len(raw_bytes)
             data["sha256"] = hashlib.sha256(raw_bytes).hexdigest()
+        if raw_bytes is not None:
+            measured = measure_mp4_dimensions(raw_bytes)
+            if measured is not None:
+                m_w, m_h = measured
+                data["measured_width"] = m_w
+                data["measured_height"] = m_h
+                data["dimensions_source"] = "measured_mp4"
+                data["width"] = m_w
+                data["height"] = m_h
+                if item.width is not None and item.height is not None:
+                    mismatch = (item.width, item.height) != (m_w, m_h)
+                    data["dimension_mismatch"] = mismatch
+                    if mismatch:
+                        data["metadata_width"] = item.width
+                        data["metadata_height"] = item.height
+                        data["metadata_dimensions_source"] = getattr(item, "dimensions_source", None)
+            elif verify_dimensions:
+                data["dimension_probe_failed"] = True
         if output_path is not None:
             saved = await client.download_media(item, output_path=output_path)
             data["saved_path"] = str(saved)
@@ -817,6 +861,16 @@ def create_server(
 
         return await _run_media_generation_job(
             op="generate_image",
+            params={
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "count": count,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+                "base_image_media_id": base_image_media_id,
+                "seed": seed,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -892,6 +946,20 @@ def create_server(
 
         return await _run_media_generation_job(
             op="generate_video",
+            params={
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "duration_seconds": duration_seconds,
+                "count": count,
+                "start_frame_media_id": start_frame_media_id,
+                "end_frame_media_id": end_frame_media_id,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+                "scene_id": scene_id,
+                "seed": seed,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -939,6 +1007,15 @@ def create_server(
 
         return await _run_media_generation_job(
             op="extend_video",
+            params={
+                "video_media_id": video_media_id,
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -976,6 +1053,12 @@ def create_server(
 
         return await _run_media_generation_job(
             op="upsample_video",
+            params={
+                "video_media_id": video_media_id,
+                "target": target,
+                "aspect_ratio": aspect_ratio,
+                "project_id": project_id,
+            },
             idempotency_key=idempotency_key,
             wait=wait,
             wait_timeout_seconds=wait_timeout_seconds,
@@ -1145,6 +1228,7 @@ def create_server(
                     custom_dest.write_bytes(saved.read_bytes())
 
             size_bytes, sha_hex = compute_file_checksum(saved)
+            measured = measure_mp4_dimensions(saved.read_bytes())
             return {
                 "kind": "scene_export",
                 "status": "completed",
@@ -1154,12 +1238,17 @@ def create_server(
                 "upstream_mp4_url": upstream_url,
                 "file_size_bytes": size_bytes,
                 "sha256": sha_hex,
+                "measured_width": measured[0] if measured else None,
+                "measured_height": measured[1] if measured else None,
             }
 
         record, replayed = await jobs.submit_or_reuse(
             op="scene_export",
             idempotency_key=idempotency_key,
             submit_fn=_do_export,
+            params_fingerprint=_params_fingerprint(
+                {"scene_id": scene_id.strip(), "project_id": project_id, "output_path": output_path}
+            ),
         )
         result = {
             **record,
