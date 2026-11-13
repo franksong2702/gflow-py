@@ -226,3 +226,29 @@ async def test_load_state_drops_clients_with_malicious_redirect(tmp_path: Path) 
     assert "evil" not in saved["clients"]
     assert "mixed" not in saved["clients"]
     assert {"good", "claude-com"} <= set(saved["clients"])
+
+
+async def test_authorize_rejects_allowlisted_uri_not_registered_by_this_client(tmp_path) -> None:
+    from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    from gflow.mcp._oauth import SelfHostedOAuthProvider
+
+    provider = SelfHostedOAuthProvider(
+        password="CorrectHorseBatteryStaple2026!",
+        base_url="https://flow-host.example.ts.net:8443",
+        state_path=tmp_path / "state.json",
+    )
+    client = OAuthClientInformationFull(
+        client_id="a", redirect_uris=["https://claude.ai/api/mcp/auth_callback"]
+    )
+    await provider.register_client(client)
+    params = AuthorizationParams(
+        state="s",
+        scopes=[],
+        code_challenge="E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        redirect_uri="https://claude.com/api/mcp/auth_callback",
+        redirect_uri_provided_explicitly=True,
+    )
+    with pytest.raises(AuthorizeError):
+        await provider.authorize(client, params)

@@ -293,8 +293,11 @@ class SelfHostedOAuthProvider(InMemoryOAuthProvider):
         client: OAuthClientInformationFull,
         params: AuthorizationParams,
     ) -> str:
-        if params.redirect_uri is None or not self._redirect_uri_allowed(
-            str(params.redirect_uri)
+        registered = {str(u) for u in (client.redirect_uris or [])}
+        if (
+            params.redirect_uri is None
+            or not self._redirect_uri_allowed(str(params.redirect_uri))
+            or str(params.redirect_uri) not in registered
         ):
             raise AuthorizeError(
                 error="invalid_request",
