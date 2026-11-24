@@ -377,6 +377,8 @@ class _FakeGuardedRpc:
             usages = [
                 ["macaron_cookie_edit"],
                 ["macaron_cookie_edit_360p"],
+                ["macaron_cookie_edit_entry"],
+                ["macaron_cookie_edit_entry_360p"],
                 ["macaron_cookie_extend_8s"],
                 ["macaron_cookie_extend_10s"],
                 ["macaron_cookie_extend_10s_360p"],
@@ -798,3 +800,102 @@ def test_cli_extend_duration_upload_video_and_edit(monkeypatch, tmp_path: Path) 
     assert mock.edit_calls[-1]["video"] == "up-vid-001"
     assert mock.edit_calls[-1]["resolution"] == "360p"
     assert mock.edit_calls[-1]["end_time_seconds"] == 4.0
+
+
+# ── 8. PR #3 review hardening regressions ────────────────────────────────────
+
+
+async def test_review_hardening_duration_rollover_and_soft_wait_upload_route(monkeypatch, tmp_path: Path) -> None:
+    from gflow._proto import duration_to_pb
+
+    # Nanosecond rounding rollover (3.9999999999 -> [4], never [3, 1_000_000_000])
+    assert duration_to_pb(3.9999999999) == [4]
+
+    # Entry-tier edit_video rejects explicit >10s window & preserves start_time when src duration unknown
+    rpc = _FakeGuardedRpc()
+    client = FlowClient(rpc, storage_state_path=tmp_path / "storage.json")  # type: ignore[arg-type]
+    captured: list[tuple[str, Any]] = []
+
+    async def _fake_guarded(_action: str, pid: str, build_fn: Any) -> Any:
+        r_id, r_payload = build_fn("tok-test")
+        captured.append((r_id, r_payload))
+        return [[["out-vid-2", pid, "wf-out", None, None, None, None, None]]]
+
+    client._call_guarded = _fake_guarded  # type: ignore[method-assign]
+    client._cached_service_tier = 1
+    with pytest.raises(ValidationError, match="10s"):
+        await client.edit_video(
+            "11111111-2222-3333-4444-555555555555",
+            "unknown-vid",
+            "relight",
+            start_time_seconds=0.0,
+            end_time_seconds=12.0,
+            wait=False,
+        )
+
+    # When get_media has no duration (e.g. raises NotFoundError), explicit start_time_seconds is still preserved
+    async def _missing_media(_mid: str) -> MediaItem:
+        raise ValidationError("no metadata")
+
+    client.get_media = _missing_media  # type: ignore[method-assign]
+    await client.edit_video(
+        "11111111-2222-3333-4444-555555555555",
+        "unknown-vid",
+        "relight",
+        start_time_seconds=2.0,
+        wait=False,
+    )
+    assert captured[-1][0] == RPC_VIDEO_EDIT
+    assert captured[-1][1][0][0][0][2] == 48  # start_frame = 2.0 * 24fps
+    assert captured[-1][1][0][0][0][5] == [2]  # start_time Duration = 2s
+
+    # Boolean / NaN guards on numeric parameters
+    for bad_kw in (
+        {"count": True},
+        {"start_time_seconds": float("nan")},
+        {"end_time_seconds": float("inf")},
+    ):
+        with pytest.raises(ValidationError):
+            await client.edit_video(
+                "11111111-2222-3333-4444-555555555555",
+                "unknown-vid",
+                "relight",
+                wait=False,
+                **bad_kw,  # type: ignore[arg-type]
+            )
+
+    # /files/ul/{token} with wait=0 returns 200 + media_id + media_status='running' without discarding media_id
+    monkeypatch.setenv("GFLOW_HOME", str(tmp_path / "ul_home"))
+    mock = _OmniMockClient()
+
+    async def _pending_upload(project_id: str | None, source: Any, **kwargs: Any) -> MediaItem:
+        return MediaItem(
+            id="up-pending-999",
+            project_id=project_id or "proj-1111",
+            media_type="video",
+            status="running",
+            mime_type="video/mp4",
+        )
+
+    mock.upload_video = _pending_upload  # type: ignore[method-assign]
+    ft = FileTransferConfig(
+        signer=FileLinkSigner.from_persistent_store(tmp_path / "ul_home" / "secret.key"),
+        base_url="https://flow-host.example.ts.net:8443",
+    )
+    server = create_server(client_factory=lambda: mock, file_transfer=ft)  # type: ignore[arg-type]
+    ul_meta = _extract_json(await server.call_tool("flow_create_upload_link", {"kind": "video"}))
+    ul_path = "/" + ul_meta["upload_url"].split(":8443/", 1)[1]
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.http_app()),
+        base_url="https://flow-host.example.ts.net:8443",
+    ) as http:
+        r = await http.put(
+            f"{ul_path}?filename=big.mp4&wait=0",
+            content=FAKE_MP4,
+            headers={"Content-Type": "video/mp4"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["media_id"] == "up-pending-999"
+        assert body["media_status"] == "running"

@@ -91,6 +91,9 @@ def _safe_get(obj: Any, idx: int, default: Any = None) -> Any:
 def duration_to_pb(seconds: float | int) -> list[int]:
     whole = int(math.floor(float(seconds)))
     nanos = int(round((float(seconds) - whole) * 1_000_000_000))
+    if nanos >= 1_000_000_000:
+        whole += 1
+        nanos -= 1_000_000_000
     return [whole, nanos] if nanos else [whole]
 
 
@@ -231,7 +234,8 @@ OMNI_VIDEO_ALIASES: frozenset[str] = frozenset(
 )
 
 _RAW_MACARON_RE = re.compile(
-    r"^macaron_cookie_(?:(?:t2v|i2v|i2v_fl|r2v|extend)_([3-9]|1[0-5])s|edit(?:_entry)?)(?:_360p)?(?:_portrait|_landscape)?$"
+    r"^macaron_cookie_(?:(?:t2v|i2v|i2v_fl|r2v|extend)_([3-9]|1[0-5])s|edit(?:_entry)?)"
+    r"(?:(?:_360p)?(?:_portrait|_landscape)?|(?:_portrait|_landscape)?(?:_360p)?)$"
 )
 
 

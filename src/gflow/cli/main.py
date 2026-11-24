@@ -671,6 +671,8 @@ def cmd_extend(
         console.print(f"[bold green]Extended Video:[/bold green] [cyan]{r['id']}[/cyan] ({r['status']})")
         if r.get("saved_path"):
             console.print(f"  Saved MP4: {r['saved_path']}")
+        elif r.get("download_url"):
+            console.print(f"  MP4 URL: {r['download_url']}")
 
 
 @cli.command("edit")

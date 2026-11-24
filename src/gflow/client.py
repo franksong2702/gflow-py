@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import mimetypes
 import time
 from pathlib import Path
@@ -73,7 +74,7 @@ from .exceptions import (
     RateLimitedError,
     ValidationError,
 )
-from .media_probe import detect_video_mime
+from .media_probe import detect_video_mime, measure_mp4_dimensions, measure_mp4_duration
 from .paths import get_active_profile, get_default_output_dir, get_storage_state_path, load_context
 from .types import (
     AccountCredits,
@@ -377,6 +378,13 @@ class FlowClient:
         if (trim_start_seconds is None) != (trim_end_seconds is None):
             raise ValidationError("Provide both trim_start_seconds and trim_end_seconds, or neither.")
         if trim_start_seconds is not None and trim_end_seconds is not None:
+            if (
+                isinstance(trim_start_seconds, bool)
+                or isinstance(trim_end_seconds, bool)
+                or not math.isfinite(float(trim_start_seconds))
+                or not math.isfinite(float(trim_end_seconds))
+            ):
+                raise ValidationError("trim_start_seconds and trim_end_seconds must be finite numbers.")
             if trim_start_seconds < 0:
                 raise ValidationError("trim_start_seconds must be >= 0.")
             if trim_end_seconds <= trim_start_seconds:
@@ -435,6 +443,15 @@ class FlowClient:
         item = parse_video_upload_response(raw, project_id=pid, mime_type=mtype)
         if item is None:
             raise GenerationError(f"Video upload succeeded but returned no MediaItem: {raw}")
+        if item.duration_seconds is None:
+            probed_dur = measure_mp4_duration(video_bytes)
+            if probed_dur is not None:
+                item.duration_seconds = probed_dur
+        if item.width is None or item.height is None:
+            probed_dims = measure_mp4_dimensions(video_bytes)
+            if probed_dims is not None:
+                item.width, item.height = probed_dims
+                item.dimensions_source = "measured_mp4"
         if not wait:
             return item
         polled = await self.poll_media(
@@ -748,19 +765,24 @@ class FlowClient:
         """
         if not prompt.strip():
             raise ValidationError("prompt must not be empty.")
-        if not 1 <= count <= 4:
+        if isinstance(count, bool) or not 1 <= count <= 4:
             raise ValidationError("Video generation count must be between 1 and 4.")
         if references and len(references) > 3:
             raise ValidationError("reference_media_ids supports at most 3 reference images.")
-        if fps <= 0:
+        if isinstance(fps, bool) or fps <= 0:
             raise ValidationError("fps must be a positive integer.")
-        if start_time_seconds is not None and start_time_seconds < 0:
-            raise ValidationError("start_time_seconds must be >= 0.")
+        if start_time_seconds is not None:
+            if isinstance(start_time_seconds, bool) or not math.isfinite(float(start_time_seconds)):
+                raise ValidationError("start_time_seconds must be a finite number.")
+            if start_time_seconds < 0:
+                raise ValidationError("start_time_seconds must be >= 0.")
         if end_time_seconds is not None:
-            eff_s = start_time_seconds if start_time_seconds is not None else 0.0
+            if isinstance(end_time_seconds, bool) or not math.isfinite(float(end_time_seconds)):
+                raise ValidationError("end_time_seconds must be a finite number.")
+            eff_s = float(start_time_seconds) if start_time_seconds is not None else 0.0
             if end_time_seconds <= eff_s:
                 raise ValidationError("end_time_seconds must be greater than start_time_seconds.")
-            span = end_time_seconds - eff_s
+            span = float(end_time_seconds) - eff_s
             if span < MIN_EDIT_VIDEO_SECONDS or span > MAX_EDIT_VIDEO_SECONDS:
                 raise ValidationError(
                     f"Edit clip window must be between {int(MIN_EDIT_VIDEO_SECONDS)} and "
@@ -826,21 +848,27 @@ class FlowClient:
         eff_start = float(start_time_seconds) if start_time_seconds is not None else 0.0
         eff_end: float | None
         if end_time_seconds is not None:
-            eff_end = min(float(end_time_seconds), eff_start + max_edit_sec)
-        elif src_duration is not None and src_duration > 0:
-            if src_duration < eff_start:
+            if (float(end_time_seconds) - eff_start) > max_edit_sec:
                 raise ValidationError(
-                    f"start_time_seconds ({eff_start}s) exceeds source video duration ({src_duration}s)."
+                    f"Edit clip window ({float(end_time_seconds) - eff_start:.2f}s) exceeds maximum "
+                    f"{int(max_edit_sec)}s supported by model {resolved_key!r}."
+                )
+            eff_end = float(end_time_seconds)
+        elif src_duration is not None and src_duration > 0:
+            if src_duration <= eff_start:
+                raise ValidationError(
+                    f"start_time_seconds ({eff_start}s) must be less than source video duration ({src_duration}s)."
                 )
             eff_end = min(eff_start + max_edit_sec, float(src_duration))
-            if (eff_end - eff_start) < 2.5:
+            if (eff_end - eff_start) < (MIN_EDIT_VIDEO_SECONDS - 0.1):
                 raise ValidationError(
                     f"Source video clip ({eff_end - eff_start:.2f}s) is shorter than the 3s minimum for Omni video editing."
                 )
         else:
             eff_end = None
 
-        edit_start_frame = round(eff_start * fps) if eff_end is not None else None
+        has_start = start_time_seconds is not None or eff_end is not None
+        edit_start_frame = round(eff_start * fps) if has_start else None
         edit_end_frame = round(eff_end * fps) if eff_end is not None else None
 
         ref_ids = (
@@ -862,7 +890,7 @@ class FlowClient:
                 edit_video_media_id=video_media_id,
                 edit_start_frame=edit_start_frame,
                 edit_end_frame=edit_end_frame,
-                edit_start_time_seconds=eff_start if eff_end is not None else None,
+                edit_start_time_seconds=eff_start if has_start else None,
                 edit_end_time_seconds=eff_end,
                 reference_media_ids=ref_ids if ref_ids else None,
                 recaptcha_token=tok,

@@ -10,6 +10,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import mimetypes
 import shutil
 import time
@@ -895,6 +896,13 @@ def create_server(
         if (trim_start_seconds is None) != (trim_end_seconds is None):
             raise ValidationError("Provide both trim_start_seconds and trim_end_seconds, or neither.")
         if trim_start_seconds is not None and trim_end_seconds is not None:
+            if (
+                isinstance(trim_start_seconds, bool)
+                or isinstance(trim_end_seconds, bool)
+                or not math.isfinite(float(trim_start_seconds))
+                or not math.isfinite(float(trim_end_seconds))
+            ):
+                raise ValidationError("trim_start_seconds and trim_end_seconds must be finite numbers.")
             if trim_start_seconds < 0:
                 raise ValidationError("trim_start_seconds must be >= 0.")
             if trim_end_seconds <= trim_start_seconds:
@@ -1379,17 +1387,22 @@ def create_server(
             raise ValidationError("prompt must not be empty.")
         if not video_media_id.strip():
             raise ValidationError("video_media_id must not be empty.")
-        if not 1 <= count <= 4:
+        if isinstance(count, bool) or not 1 <= count <= 4:
             raise ValidationError("count must be between 1 and 4.")
         if reference_media_ids and len(reference_media_ids) > 3:
             raise ValidationError("reference_media_ids supports at most 3 reference images.")
-        if start_time_seconds is not None and start_time_seconds < 0:
-            raise ValidationError("start_time_seconds must be >= 0.")
+        if start_time_seconds is not None:
+            if isinstance(start_time_seconds, bool) or not math.isfinite(float(start_time_seconds)):
+                raise ValidationError("start_time_seconds must be a finite number.")
+            if start_time_seconds < 0:
+                raise ValidationError("start_time_seconds must be >= 0.")
         if end_time_seconds is not None:
-            eff_s = start_time_seconds if start_time_seconds is not None else 0.0
+            if isinstance(end_time_seconds, bool) or not math.isfinite(float(end_time_seconds)):
+                raise ValidationError("end_time_seconds must be a finite number.")
+            eff_s = float(start_time_seconds) if start_time_seconds is not None else 0.0
             if end_time_seconds <= eff_s:
                 raise ValidationError("end_time_seconds must be greater than start_time_seconds.")
-            span = end_time_seconds - eff_s
+            span = float(end_time_seconds) - eff_s
             if span < MIN_EDIT_VIDEO_SECONDS or span > MAX_EDIT_VIDEO_SECONDS:
                 raise ValidationError(
                     f"Edit clip window must be between {int(MIN_EDIT_VIDEO_SECONDS)} and "

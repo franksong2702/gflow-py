@@ -4,8 +4,9 @@ description: >-
   Drive Google Flow (flow.google.com) via the gflow CLI and MCP tools to manage
   AI filmmaking projects, check credits, generate Nano Banana images, generate
   Veo 3.1 / Omni 1.2 videos (text-to-video, start-frame, start+end frame
-  interpolation, multi-reference character consistency, video extension,
-  1080p/4K upscaling), and assemble/export multi-shot timelines in Scene Builder.
+  interpolation, multi-reference character consistency, 3-10s video extension,
+  own-footage video upload and conversational 3-15s video editing, 1080p/4K
+  upscaling), and assemble/export multi-shot timelines in Scene Builder.
 ---
 
 # Google Flow (`gflow`) Agent Skill

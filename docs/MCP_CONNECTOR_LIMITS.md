@@ -50,7 +50,7 @@ Remote VM callers can upload keyframes, reference images, and own 3–15s video 
 ## 4. Download Link Activation Condition, Auth Method, & TTL (`P0-2`, `P2-6`)
 
 ### Exact Condition When `download_link` Is Returned
-- `download_link` (and `browser_url`) is **always returned** on `flow_generate_video`, `flow_generate_image`, `flow_extend_video`, `flow_upsample_video`, `flow_upload_image`, `flow_save_video_frame`, `flow_get_media`, `flow_poll_media`, `flow_project_contents`, and **`flow_scene_export_mp4`** whenever **`gflow-mcp` is started with `GFLOW_MCP_OAUTH_BASE_URL` or `GFLOW_MCP_PUBLIC_URL` set**.
+- `download_link` (and `browser_url`) is **always returned** on `flow_generate_video`, `flow_generate_image`, `flow_extend_video`, `flow_edit_video`, `flow_upsample_video`, `flow_upload_image`, `flow_upload_video`, `flow_save_video_frame`, `flow_get_media`, `flow_poll_media`, `flow_project_contents`, and **`flow_scene_export_mp4`** whenever **`gflow-mcp` is started with `GFLOW_MCP_OAUTH_BASE_URL` or `GFLOW_MCP_PUBLIC_URL` set**.
 - Because remote OAuth HTTP deployments (`https://<host>.<tailnet>.ts.net:8443/mcp`) always set `GFLOW_MCP_OAUTH_BASE_URL`, **HTTP file transfer is 100% active on all remote calls**. Callers can programmatically confirm this via `flow_account_usage()`, which returns:
   - `"file_transfer_active": true`
   - `"download_link_ttl_seconds": 86400`
@@ -80,7 +80,7 @@ Remote VM callers can upload keyframes, reference images, and own 3–15s video 
 
 ## 6. Timeout Protection, `job_id`, & Idempotency (`P1-4`)
 
-- **Shielded Submission**: Every `flow_generate_video`, `flow_extend_video`, `flow_upsample_video`, `flow_generate_image`, and `flow_scene_export_mp4` call executes upstream submission inside `asyncio.shield` and atomically persists `job_id` + `media_ids` + `idempotency_key` to `~/.gflow/jobs.json` (`0600`). Even if the remote VM HTTP client disconnects mid-request, the job record is preserved.
+- **Shielded Submission**: Every `flow_generate_video`, `flow_extend_video`, `flow_edit_video`, `flow_upsample_video`, `flow_generate_image`, and `flow_scene_export_mp4` call executes upstream submission inside `asyncio.shield` and atomically persists `job_id` + `media_ids` + `idempotency_key` to `~/.gflow/jobs.json` (`0600`). Even if the remote VM HTTP client disconnects mid-request, the job record is preserved.
 - **Soft-Wait Ceiling (< 45s Client Timeout)**: Even when `wait=True` (default), generation tools poll for at most `wait_timeout_seconds` (**default `25.0s`, hard cap `35.0s`**) and return `{"job_id": "job_...", "status": "running", "media_ids": [...]}` cleanly *before* a 45-second remote MCP HTTP timeout can sever the connection.
 - **Polling**: Call `flow_poll_media(job_id=...)` (or `flow_poll_media(idempotency_key=...)`) until `"status": "completed"`, at which point `items[i]["download_link"]` is ready to download.
 - **Idempotency**: Passing `idempotency_key="<caller-unique-id>"` guarantees **at-most-once upstream execution** (both for concurrent in-flight retries and sequential retries over 7 days), returning `"idempotent_replay": true` with the original `job_id` and **never charging duplicate Flow credits**.

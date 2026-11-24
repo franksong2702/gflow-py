@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
+import math
 import mimetypes
 import re
 import time
@@ -283,7 +285,12 @@ btn.addEventListener('click', async () => {{
     }}
     const data = JSON.parse(text);
     st.style.color = '#15803d';
-    st.innerHTML = '<b>Uploaded!</b> Media ID: <code>' + data.media_id + '</code><br>You can close this tab and tell your assistant to continue.';
+    st.textContent = '';
+    const b = document.createElement('b');
+    b.textContent = 'Uploaded! ';
+    const code = document.createElement('code');
+    code.textContent = data.media_id || '';
+    st.append(b, 'Media ID: ', code, document.createElement('br'), 'You can close this tab and tell your assistant to continue.');
   }} catch (err) {{
     st.style.color = '#dc2626';
     st.textContent = 'Network error: ' + err;
@@ -392,7 +399,12 @@ btn.addEventListener('click', async () => {{
                                 raise ValueError("both required")
                             trim_start = float(raw_ts)
                             trim_end = float(raw_te)
-                            if trim_start < 0 or trim_end <= trim_start:
+                            if (
+                                not math.isfinite(trim_start)
+                                or not math.isfinite(trim_end)
+                                or trim_start < 0
+                                or trim_end <= trim_start
+                            ):
                                 raise ValueError("invalid range")
                         except ValueError:
                             return PlainTextResponse(
@@ -411,9 +423,17 @@ btn.addEventListener('click', async () => {{
                         mime_type=mime,
                         trim_start_seconds=trim_start,
                         trim_end_seconds=trim_end,
-                        wait=should_wait,
-                        timeout=60.0,
+                        wait=False,
                     )
+                    if should_wait and not item.download_url:
+                        deadline = time.monotonic() + 25.0
+                        while True:
+                            polled = await client.poll_media([item.id], wait=False)
+                            if polled:
+                                item = polled[0]
+                            if item.download_url or time.monotonic() >= deadline:
+                                break
+                            await asyncio.sleep(2.0)
                     dl_info = config.download_link_for_media(item.id)
                     result = {
                         "media_id": item.id,
