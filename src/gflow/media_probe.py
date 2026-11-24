@@ -9,7 +9,23 @@ from __future__ import annotations
 import struct
 from collections.abc import Iterator
 
-__all__ = ["measure_mp4_dimensions"]
+__all__ = ["detect_video_mime", "measure_mp4_dimensions", "measure_mp4_duration"]
+
+_NON_VIDEO_ISOBMFF_BRANDS = frozenset(
+    {
+        b"heic",
+        b"heix",
+        b"hevc",
+        b"hevx",
+        b"mif1",
+        b"msf1",
+        b"avif",
+        b"avis",
+        b"M4A ",
+        b"M4B ",
+        b"M4P ",
+    }
+)
 
 _VISUAL_SAMPLE_ENTRIES = frozenset(
     {b"avc1", b"avc3", b"hvc1", b"hev1", b"av01", b"vp08", b"vp09", b"mp4v", b"dvh1", b"dvhe", b"encv"}
@@ -165,3 +181,70 @@ def measure_mp4_dimensions(data: bytes) -> tuple[int, int] | None:
         return _measure(buf)
     except (struct.error, IndexError, ValueError, OverflowError):
         return None
+
+
+def _measure_duration(buf: bytes) -> float | None:
+    moov = _find_child(buf, 0, len(buf), b"moov")
+    if moov is None:
+        return None
+    mvhd = _find_child(buf, moov[0], moov[1], b"mvhd")
+    if mvhd is None:
+        return None
+    start, end = mvhd
+    if end - start < 20:
+        return None
+    version = buf[start]
+    if version == 0:
+        if end - start < 20:
+            return None
+        timescale, duration = struct.unpack_from(">II", buf, start + 12)
+    elif version == 1:
+        if end - start < 32:
+            return None
+        timescale, duration = struct.unpack_from(">IQ", buf, start + 20)
+    else:
+        return None
+    if timescale <= 0 or duration <= 0:
+        return None
+    return round(duration / timescale, 3)
+
+
+def measure_mp4_duration(data: bytes) -> float | None:
+    """Measure movie duration in seconds from MP4/MOV ``moov/mvhd`` box (pure Python, no ffprobe)."""
+    try:
+        buf = bytes(data)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return _measure_duration(buf)
+    except (struct.error, IndexError, ValueError, OverflowError):
+        return None
+
+
+def detect_video_mime(data: bytes) -> tuple[str, str] | None:
+    """Detect a Google Flow-supported video container from magic bytes.
+
+    Returns ``(mime_type, default_ext)`` or ``None`` if magic bytes do not match a supported
+    video container (MP4, QuickTime MOV, M4V, 3GP, WebM, AVI).
+    """
+    if len(data) < 12:
+        return None
+    if data[4:8] == b"ftyp":
+        brand = bytes(data[8:12])
+        if brand in _NON_VIDEO_ISOBMFF_BRANDS:
+            return None
+        if brand == b"qt  ":
+            return "video/quicktime", ".mov"
+        if brand.startswith(b"3g"):
+            return "video/3gpp", ".3gp"
+        if brand == b"M4V ":
+            return "video/x-m4v", ".m4v"
+        return "video/mp4", ".mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        header_window = bytes(data[:64]).lower()
+        if b"webm" in header_window or b"matroska" in header_window:
+            return "video/webm", ".webm"
+        return "video/webm", ".webm"
+    if data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "video/x-msvideo", ".avi"
+    return None

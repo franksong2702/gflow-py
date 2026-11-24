@@ -4,8 +4,9 @@ description: >-
   Drive Google Flow (flow.google.com) via the gflow CLI and MCP tools to manage
   AI filmmaking projects, check credits, generate Nano Banana images, generate
   Veo 3.1 / Omni 1.2 videos (text-to-video, start-frame, start+end frame
-  interpolation, multi-reference character consistency, video extension,
-  1080p/4K upscaling), and assemble/export multi-shot timelines in Scene Builder.
+  interpolation, multi-reference character consistency, 3-10s video extension,
+  own-footage video upload and conversational 3-15s video editing, 1080p/4K
+  upscaling), and assemble/export multi-shot timelines in Scene Builder.
 ---
 
 # Google Flow (`gflow`) Agent Skill
@@ -66,11 +67,16 @@ gflow generate video "The puppy plays with the yellow duck in the living room" \
 # 5) Extract a Video Frame (e.g. last frame of Shot 1 to anchor Shot 2)
 gflow frame-save <video_media_id> --at 3.8
 
-# 6) Extend an Existing Video Clip (+4s..8s continuation)
+# 6) Extend an Existing Video Clip (3..10s continuation on Omni 1.2 Flash; 8s default)
 gflow extend <video_media_id> "Camera pans up to reveal confetti falling" \
-  --aspect 9:16 --download
+  --model omni --duration 10 --aspect 9:16 --download
 
-# 7) Upscale Video to 1080p or 4K
+# 7) Upload & Conversationally Edit Your Own 3-15s Video Footage (Omni 1.2 Flash)
+gflow upload-video ./clip.mp4
+gflow edit <video_media_id_or_local_path> "Change lighting to moody golden hour sunset, slow dolly in" \
+  --model omni --download
+
+# 8) Upscale Video to 1080p or 4K
 gflow upsample <video_media_id> --target 1080p --download
 ```
 
@@ -91,7 +97,7 @@ gflow scene export <scene_id> -o ./final_cut.mp4
 
 When driving `gflow-mcp` from a remote VM or `claude.ai` custom connector:
 
-- **Direct Keyframe Upload (No Human Relay)**: Call `flow_upload_image(image_base64="<base64>", file_name="shot01.png")` (max `15 MiB` decoded `PNG`/`JPEG`/`WebP`) or `PUT` raw bytes to `flow_create_upload_link` (`20 MiB` max, `30m` TTL) to get `media_id` for `start_frame_media_id` / `end_frame_media_id` / `reference_media_ids` (max `3` references).
+- **Direct Keyframe & Own-Footage Upload (No Human Relay)**: Call `flow_upload_image(image_base64="<base64>", file_name="shot01.png")` (max `15 MiB` decoded `PNG`/`JPEG`/`WebP`) or `PUT` raw bytes to `flow_create_upload_link(kind="image")` (`20 MiB` max, `30m` TTL) for frames/references. For own 3–15s video editing, call `flow_upload_video(video_base64=...)` (`15 MiB` max) or `PUT` raw MP4/MOV/WebM bytes to `flow_create_upload_link(kind="video")` (`100 MiB` max, `30m` TTL), then call `flow_edit_video(video_media_id=..., prompt=...)`.
 - **Direct Finished Asset Download**: Generated items and `flow_scene_export_mp4` return unauthenticated HMAC-signed `download_link` URLs (`24h` / `86,400s` TTL) plus `file_size_bytes` & `sha256` (`X-GFlow-Bytes`, `X-GFlow-SHA256` headers). Scene exports and job records are retained on server disk for `7 days`.
 - **Timeout Safety & Idempotency**: Always pass a deterministic `idempotency_key` on `flow_generate_*` / `flow_scene_export_mp4`. Tools return `job_id` within `wait_timeout_seconds` (`25s` default, `35s` max) before client HTTP timeout; poll completion with `flow_poll_media(job_id=...)`. Retrying with the same `idempotency_key` never creates a duplicate task or charges duplicate Flow credits.
 - **Structured Error Codes**: Inspect `error_code` on tool errors: `AUTH_EXPIRED` (stop & ask operator to login), `QUOTA_EXCEEDED` (stop & check credits), `INVALID_INPUT` (fix params/prompt), `RATE_LIMITED` (backoff & retry with same `idempotency_key`), `UPSTREAM_ERROR` (transient retry), `NOT_FOUND` (verify ID).

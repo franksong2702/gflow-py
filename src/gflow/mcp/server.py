@@ -10,6 +10,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import mimetypes
 import shutil
 import time
@@ -30,19 +31,26 @@ from .._proto import (
     resolve_video_resolution,
 )
 from ..auth import DEFAULT_KEEPALIVE_INTERVAL_SECONDS
-from ..client import FlowClient
+from ..client import (
+    ALLOWED_VIDEO_MIMES,
+    MAX_EDIT_VIDEO_SECONDS,
+    MAX_VIDEO_UPLOAD_BYTES,
+    MIN_EDIT_VIDEO_SECONDS,
+    FlowClient,
+)
 from ..exceptions import NotFoundError, ValidationError
-from ..media_probe import measure_mp4_dimensions
+from ..media_probe import detect_video_mime, measure_mp4_dimensions
 from ..paths import get_active_profile, load_context, save_context
 from ..types import MediaItem
 from ._errors import structured_tool
 from ._filelink import DEFAULT_UPLOAD_TTL_SECONDS, FileTransferConfig
 from ._jobs import JobStore
-from ._ssrf import ImageFetchError, fetch_public_image
+from ._ssrf import ImageFetchError, fetch_public_image, fetch_public_media
 from ._pathguard import resolve_confined_output
 
 __all__ = [
     "MAX_INLINE_IMAGE_BYTES",
+    "MAX_INLINE_VIDEO_BYTES",
     "SERVER_INSTRUCTIONS",
     "SERVER_NAME",
     "create_server",
@@ -51,11 +59,16 @@ __all__ = [
 SERVER_NAME = "gflow"
 MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MiB decoded bytes for inline JSON-RPC base64
 MAX_URL_FETCH_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MiB (`20,971,520` bytes) exact Google Flow image cap
+MAX_INLINE_VIDEO_BYTES = 15 * 1024 * 1024  # 15 MiB decoded bytes for inline JSON-RPC video base64
+MAX_URL_FETCH_VIDEO_BYTES = MAX_VIDEO_UPLOAD_BYTES  # 100 MiB (`104,857,600` bytes) exact Google Flow video cap
 DEFAULT_SOFT_WAIT_SECONDS = 25.0
 MAX_SOFT_WAIT_SECONDS = 35.0  # Stay safely under 45s remote client HTTP timeout
 
 _FILE_PATH_DISABLED = (
     "file_path is disabled on the remote HTTP transport; use image_base64 or flow_create_upload_link."
+)
+_VIDEO_FILE_PATH_DISABLED = (
+    "file_path is disabled on the remote HTTP transport; use video_base64, video_url, or flow_create_upload_link(kind='video')."
 )
 _PROFILE_SWITCH_DISABLED = (
     "Switching profile is disabled on the remote HTTP transport; omit profile to use the server active profile."
@@ -101,10 +114,12 @@ def _params_fingerprint(params: dict[str, Any] | None) -> str | None:
 SERVER_INSTRUCTIONS = (
     "Drive Google Flow (flow.google.com) over MCP.\n"
     "Key Remote & Production Semantics:\n"
-    "1. Remote Image Upload (no human needed): Call `flow_upload_image(image_base64=..., file_name=...)` "
-    "(<= 15 MiB / 15,728,640 decoded bytes; PNG/JPEG/WebP) OR `flow_create_upload_link` + HTTP PUT raw bytes "
-    "(<= 20 MiB / 20,971,520 bytes, 30m / 1,800s TTL) to obtain a `media_id` for `start_frame_media_id` / "
-    "`end_frame_media_id` / `reference_media_ids`.\n"
+    "1. Remote Image & Video Upload (no human needed): Call `flow_upload_image(image_base64=..., file_name=...)` "
+    "(<= 15 MiB / 15,728,640 decoded bytes; PNG/JPEG/WebP) OR `flow_create_upload_link(kind='image')` + HTTP PUT "
+    "(<= 20 MiB / 20,971,520 bytes, 30m TTL) for keyframes/references. For own 3-15s video footage editing, call "
+    "`flow_upload_video(video_base64=...)` (<= 15 MiB) or `flow_create_upload_link(kind='video')` + HTTP PUT / "
+    "`video_url` (<= 100 MiB / 104,857,600 bytes, 30m TTL; MP4/MOV/WebM/M4V/3GP/AVI), then `flow_edit_video` "
+    "(Omni 1.2 Flash `jIps6`) or `flow_extend_video(duration_seconds=3..10)`.\n"
     "2. Direct Asset Download: When HTTP file transfer is active (always enabled on HTTPS OAuth deployments), "
     "generated media, `flow_get_media`, and `flow_scene_export_mp4` return `download_link` (unauthenticated "
     "HMAC-SHA256 HTTPS URL, 24h / 86,400s TTL, with `X-GFlow-Bytes` & `X-GFlow-SHA256` headers). "
@@ -195,6 +210,66 @@ def _decode_base64_image(data_b64: str) -> bytes:
         return base64.b64decode(cleaned, validate=False)
     except (binascii.Error, ValueError) as exc:
         raise ValidationError(f"Invalid base64 encoding in image_base64: {exc}") from exc
+
+
+def _detect_and_validate_video_bytes(
+    raw: bytes,
+    *,
+    file_name: str = "clip.mp4",
+    explicit_mime: str | None = None,
+    max_bytes: int = MAX_INLINE_VIDEO_BYTES,
+) -> tuple[str, str]:
+    """Validate video size & magic bytes (`MP4`, `MOV`, `WebM`, `M4V`, `3GP`, `AVI`)."""
+    if not raw:
+        raise ValidationError("Uploaded video data is empty.")
+    if len(raw) > max_bytes:
+        limit_mib = max_bytes / (1024 * 1024)
+        raise ValidationError(
+            f"Video size ({len(raw)} bytes) exceeds limit ({limit_mib:.0f} MiB). "
+            "Use flow_create_upload_link(kind='video') + HTTP PUT for videos up to 100 MiB (104,857,600 bytes)."
+        )
+
+    detected = detect_video_mime(raw)
+    if detected is None:
+        raise ValidationError(
+            "Unsupported video format (invalid magic bytes). Supported formats: MP4, MOV (QuickTime), WebM, M4V, 3GP, AVI."
+        )
+    detected_mime, default_ext = detected
+
+    if explicit_mime:
+        clean_mime = explicit_mime.split(";")[0].strip().lower()
+        if clean_mime not in ALLOWED_VIDEO_MIMES:
+            raise ValidationError(
+                f"Unsupported video mime_type {explicit_mime!r}. Supported: {', '.join(sorted(ALLOWED_VIDEO_MIMES))}."
+            )
+
+    clean_name = Path(file_name.strip() or f"clip{default_ext}").name
+    if "." not in clean_name:
+        clean_name = f"{clean_name}{default_ext}"
+    if len(clean_name) > 256:
+        raise ValidationError("file_name must not exceed 256 characters.")
+    return detected_mime, clean_name
+
+
+def _decode_base64_video(data_b64: str) -> bytes:
+    """Decode raw base64 or `data:video/...;base64,...` string into bytes."""
+    cleaned = data_b64.strip()
+    if not cleaned:
+        raise ValidationError("video_base64 must not be empty.")
+    if cleaned.startswith("data:"):
+        comma = cleaned.find(",")
+        if comma == -1:
+            raise ValidationError("Malformed data URL in video_base64.")
+        cleaned = cleaned[comma + 1 :].strip()
+    if len(cleaned) > int(MAX_INLINE_VIDEO_BYTES * 1.4) + 1024:
+        raise ValidationError(
+            f"video_base64 exceeds the {MAX_INLINE_VIDEO_BYTES // (1024 * 1024)} MiB inline limit. "
+            "Use flow_create_upload_link(kind='video') + HTTP PUT (up to 100 MiB) instead."
+        )
+    try:
+        return base64.b64decode(cleaned, validate=False)
+    except (binascii.Error, ValueError) as exc:
+        raise ValidationError(f"Invalid base64 encoding in video_base64: {exc}") from exc
 
 
 def _utc_iso(ts: float | None = None) -> str:
@@ -532,6 +607,8 @@ def create_server(
             "verified_limits": {
                 "inline_base64_upload_max_bytes": MAX_INLINE_IMAGE_BYTES,
                 "url_or_upload_link_max_bytes": MAX_URL_FETCH_IMAGE_BYTES,
+                "inline_video_base64_upload_max_bytes": MAX_INLINE_VIDEO_BYTES,
+                "video_url_or_upload_link_max_bytes": MAX_URL_FETCH_VIDEO_BYTES,
                 "upload_link_ttl_seconds": DEFAULT_UPLOAD_TTL_SECONDS,
                 "download_link_ttl_seconds": (
                     file_transfer.download_ttl_seconds if file_transfer is not None else 86400
@@ -779,25 +856,167 @@ def create_server(
 
     @mcp.tool()
     @structured_tool
+    async def flow_upload_video(
+        file_path: str | None = None,
+        video_base64: str | None = None,
+        video_url: str | None = None,
+        file_name: str = "clip.mp4",
+        mime_type: str | None = None,
+        trim_start_seconds: float | None = None,
+        trim_end_seconds: float | None = None,
+        project_id: str | None = None,
+        wait: bool = True,
+        wait_timeout_seconds: float = DEFAULT_SOFT_WAIT_SECONDS,
+    ) -> dict[str, Any]:
+        """Upload own video footage (MP4/MOV/WebM/M4V/3GP/AVI) into Google Flow and return its `media_id`.
+
+        Supply exactly ONE of:
+        - `video_base64`: Remote-friendly inline base64 data (max 15 MiB decoded). For larger clips up to 100 MiB, use `flow_create_upload_link(kind='video')` + HTTP PUT.
+        - `video_url`: HTTP/HTTPS video URL reachable by the server (max 100 MiB / 104,857,600 bytes). On public HTTP deployments only `https://` URLs on public hosts are accepted.
+        - `file_path`: Server-local filesystem path (for local stdio callers only, max 100 MiB).
+
+        Optionally pass `trim_start_seconds` and `trim_end_seconds` to trim during upload (e.g. to a 3..15s window).
+        Server-side transcoding usually takes ~15-25s; if it exceeds `wait_timeout_seconds`, returns
+        `status='running'` with `media_id` so you can poll via `flow_poll_media(media_ids=[media_id])`
+        before calling `flow_edit_video`.
+        """
+        provided = [
+            name
+            for name, val in (
+                ("file_path", file_path),
+                ("video_base64", video_base64),
+                ("video_url", video_url),
+            )
+            if val is not None and str(val).strip()
+        ]
+        if len(provided) != 1:
+            raise ValidationError(
+                "Provide exactly one of `video_base64`, `video_url`, or `file_path`."
+            )
+        if (trim_start_seconds is None) != (trim_end_seconds is None):
+            raise ValidationError("Provide both trim_start_seconds and trim_end_seconds, or neither.")
+        if trim_start_seconds is not None and trim_end_seconds is not None:
+            if (
+                isinstance(trim_start_seconds, bool)
+                or isinstance(trim_end_seconds, bool)
+                or not math.isfinite(float(trim_start_seconds))
+                or not math.isfinite(float(trim_end_seconds))
+            ):
+                raise ValidationError("trim_start_seconds and trim_end_seconds must be finite numbers.")
+            if trim_start_seconds < 0:
+                raise ValidationError("trim_start_seconds must be >= 0.")
+            if trim_end_seconds <= trim_start_seconds:
+                raise ValidationError("trim_end_seconds must be greater than trim_start_seconds.")
+
+        if file_path is not None and file_path.strip() and restricted:
+            raise ValidationError(_VIDEO_FILE_PATH_DISABLED)
+
+        client = await manager.get()
+
+        if video_base64 is not None and video_base64.strip():
+            raw_bytes = _decode_base64_video(video_base64)
+            detected_mime, clean_name = _detect_and_validate_video_bytes(
+                raw_bytes,
+                file_name=file_name,
+                explicit_mime=mime_type,
+                max_bytes=MAX_INLINE_VIDEO_BYTES,
+            )
+        elif video_url is not None and video_url.strip():
+            u = video_url.strip()
+            if restricted:
+                try:
+                    raw_bytes = await fetch_public_media(
+                        u,
+                        max_bytes=MAX_URL_FETCH_VIDEO_BYTES,
+                        timeout=60.0,
+                        accept="video/mp4,video/quicktime,video/webm,video/*;q=0.8",
+                        error_prefix="video_url",
+                    )
+                except ImageFetchError as exc:
+                    raise ValidationError(str(exc)) from None
+            else:
+                if not (u.startswith("https://") or u.startswith("http://")):
+                    raise ValidationError("video_url must start with http:// or https://.")
+                try:
+                    async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as http:
+                        resp = await http.get(u)
+                        resp.raise_for_status()
+                        raw_bytes = resp.content
+                except httpx.HTTPError as exc:
+                    raise ValidationError(f"Could not fetch video_url {u!r}: {exc}") from exc
+            detected_mime, clean_name = _detect_and_validate_video_bytes(
+                raw_bytes,
+                file_name=file_name,
+                explicit_mime=mime_type,
+                max_bytes=MAX_URL_FETCH_VIDEO_BYTES,
+            )
+        else:
+            assert file_path is not None
+            local = Path(file_path).expanduser()
+            if not local.is_file():
+                raise NotFoundError(f"Local video file does not exist on server: {local}")
+            raw_bytes = local.read_bytes()
+            guessed, _ = mimetypes.guess_type(local.name)
+            detected_mime, clean_name = _detect_and_validate_video_bytes(
+                raw_bytes,
+                file_name=local.name,
+                explicit_mime=mime_type or guessed,
+                max_bytes=MAX_URL_FETCH_VIDEO_BYTES,
+            )
+
+        item = await client.upload_video(
+            project_id,
+            raw_bytes,
+            file_name=clean_name,
+            mime_type=detected_mime,
+            trim_start_seconds=trim_start_seconds,
+            trim_end_seconds=trim_end_seconds,
+            wait=False,
+        )
+        if wait and not item.download_url:
+            status, items = await _poll_soft(
+                client,
+                [item.id],
+                wait=True,
+                wait_timeout_seconds=wait_timeout_seconds,
+            )
+            final_item = items[0] if items else item
+            data = _serialize_media(final_item, file_transfer)
+            data["status"] = status
+            return data
+        return _serialize_media(item, file_transfer)
+
+    @mcp.tool()
+    @structured_tool
     async def flow_create_upload_link(
         project_id: str | None = None,
-        label: str = "Reference or start-frame image",
+        label: str | None = None,
+        kind: Literal["image", "video"] = "image",
     ) -> dict[str, Any]:
-        """Mint a single-use HTTPS `/files/ul/{token}` endpoint (20 MiB max, 30m TTL) for large keyframes.
+        """Mint a single-use HTTPS `/files/ul/{token}` endpoint (30m TTL) for large image or video uploads.
+
+        - `kind='image'` (default): max 20 MiB (`PNG`/`JPEG`/`WebP`) for keyframes/references.
+        - `kind='video'`: max 100 MiB (`MP4`/`MOV`/`WebM`/`M4V`/`3GP`/`AVI`) for own-footage video editing.
+          Supports optional `?filename=clip.mp4&trim_start=0&trim_end=10&wait=1` query params.
 
         Supports BOTH:
         1. Automated VM binary PUT/POST (no human needed, zero base64 LLM token overhead):
-           `PUT <upload_url>?filename=frame.png` with raw image bytes -> immediately returns JSON `{"status": "completed", "media_id": "..."}`.
+           `PUT <upload_url>?filename=frame.png` (or `clip.mp4`) with raw bytes -> immediately returns JSON `{"status": "completed", "media_id": "..."}`.
         2. Browser picker UI (if opened via GET in a browser), followed by `flow_check_upload(upload_id)`.
         """
         if file_transfer is None:
             raise ValidationError(
                 "Signed HTTP upload links require HTTP transport with GFLOW_MCP_PUBLIC_URL or "
-                "GFLOW_MCP_OAUTH_BASE_URL configured. Use flow_upload_image(image_base64=...) or file_path."
+                "GFLOW_MCP_OAUTH_BASE_URL configured. Use flow_upload_image / flow_upload_video instead."
             )
+        eff_label = (
+            label
+            if label is not None
+            else ("Source video clip (3-15s)" if kind == "video" else "Reference or start-frame image")
+        )
         client = await manager.get()
         pid = await client.resolve_project_id(project_id)
-        return file_transfer.create_upload_link(pid, label=label)
+        return file_transfer.create_upload_link(pid, label=eff_label, kind=kind)
 
     @mcp.tool()
     @structured_tool
@@ -1039,6 +1258,7 @@ def create_server(
             mode=v_mode,
             is_portrait=is_portrait,
             duration_seconds=duration_seconds,
+            resolution=resolution,
         )
 
         return await _run_media_generation_job(
@@ -1086,12 +1306,13 @@ def create_server(
         model: str = "omni",
         aspect_ratio: str = "16:9",
         resolution: str = "720p",
+        duration_seconds: int = 8,
         reference_media_ids: list[str] | None = None,
         idempotency_key: str | None = None,
         wait: bool = True,
         wait_timeout_seconds: float = DEFAULT_SOFT_WAIT_SECONDS,
     ) -> dict[str, Any]:
-        """Extend an existing Flow video clip (`video_media_id`) with `job_id` & `idempotency_key` safety."""
+        """Extend an existing Flow video clip (`video_media_id`) with `duration_seconds` (`3..10` for Omni 1.2 Flash, default `8`), `job_id`, & `idempotency_key` safety."""
         if not prompt.strip():
             raise ValidationError("prompt must not be empty.")
         if not video_media_id.strip():
@@ -1100,7 +1321,13 @@ def create_server(
             raise ValidationError("reference_media_ids supports at most 3 reference images.")
         _, is_portrait = resolve_video_aspect(aspect_ratio)
         resolve_video_resolution(resolution)
-        resolve_video_model_key(model, mode="EXTEND_VIDEO", is_portrait=is_portrait)
+        resolve_video_model_key(
+            model,
+            mode="EXTEND_VIDEO",
+            is_portrait=is_portrait,
+            duration_seconds=duration_seconds,
+            resolution=resolution,
+        )
 
         return await _run_media_generation_job(
             op="extend_video",
@@ -1111,6 +1338,7 @@ def create_server(
                 "model": model,
                 "aspect_ratio": aspect_ratio,
                 "resolution": resolution,
+                "duration_seconds": duration_seconds,
                 "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
             },
             idempotency_key=idempotency_key,
@@ -1123,7 +1351,105 @@ def create_server(
                 model=model,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
+                duration_seconds=duration_seconds,
                 references=list(reference_media_ids) if reference_media_ids else None,
+                wait=False,
+            ),
+        )
+
+    @mcp.tool()
+    @structured_tool
+    async def flow_edit_video(
+        video_media_id: str,
+        prompt: str,
+        project_id: str | None = None,
+        model: str = "omni",
+        aspect_ratio: str | None = None,
+        resolution: str = "720p",
+        start_time_seconds: float | None = None,
+        end_time_seconds: float | None = None,
+        reference_media_ids: list[str] | None = None,
+        count: int = 1,
+        seed: int | None = None,
+        idempotency_key: str | None = None,
+        wait: bool = True,
+        wait_timeout_seconds: float = DEFAULT_SOFT_WAIT_SECONDS,
+    ) -> dict[str, Any]:
+        """Conversationally edit an uploaded or generated 3-15s video clip (`video_media_id`) by prompt using Omni 1.2 Flash (`jIps6`).
+
+        Preserves motion & audio continuity while changing lighting, camera path, background, or details.
+        Upload your own 3-15s clip first via `flow_upload_video` or `flow_create_upload_link(kind='video')`.
+        When `aspect_ratio` is omitted, the source clip's orientation (`16:9` / `9:16` / `1:1`) is preserved automatically.
+        Optionally narrow the edited segment with `start_time_seconds` / `end_time_seconds` (3..15s span)
+        and attach up to 3 image `reference_media_ids`.
+        """
+        if not prompt.strip():
+            raise ValidationError("prompt must not be empty.")
+        if not video_media_id.strip():
+            raise ValidationError("video_media_id must not be empty.")
+        if isinstance(count, bool) or not 1 <= count <= 4:
+            raise ValidationError("count must be between 1 and 4.")
+        if reference_media_ids and len(reference_media_ids) > 3:
+            raise ValidationError("reference_media_ids supports at most 3 reference images.")
+        if start_time_seconds is not None:
+            if isinstance(start_time_seconds, bool) or not math.isfinite(float(start_time_seconds)):
+                raise ValidationError("start_time_seconds must be a finite number.")
+            if start_time_seconds < 0:
+                raise ValidationError("start_time_seconds must be >= 0.")
+        if end_time_seconds is not None:
+            if isinstance(end_time_seconds, bool) or not math.isfinite(float(end_time_seconds)):
+                raise ValidationError("end_time_seconds must be a finite number.")
+            eff_s = float(start_time_seconds) if start_time_seconds is not None else 0.0
+            if end_time_seconds <= eff_s:
+                raise ValidationError("end_time_seconds must be greater than start_time_seconds.")
+            span = float(end_time_seconds) - eff_s
+            if span < MIN_EDIT_VIDEO_SECONDS or span > MAX_EDIT_VIDEO_SECONDS:
+                raise ValidationError(
+                    f"Edit clip window must be between {int(MIN_EDIT_VIDEO_SECONDS)} and "
+                    f"{int(MAX_EDIT_VIDEO_SECONDS)} seconds (got {span:.2f}s)."
+                )
+        is_portrait = False
+        if aspect_ratio is not None and aspect_ratio.strip():
+            _, is_portrait = resolve_video_aspect(aspect_ratio)
+        resolve_video_resolution(resolution)
+        resolve_video_model_key(
+            model,
+            mode="EDIT_VIDEO",
+            is_portrait=is_portrait,
+            resolution=resolution,
+        )
+
+        return await _run_media_generation_job(
+            op="edit_video",
+            params={
+                "video_media_id": video_media_id,
+                "prompt": prompt,
+                "project_id": project_id,
+                "model": model,
+                "aspect_ratio": aspect_ratio,
+                "resolution": resolution,
+                "start_time_seconds": start_time_seconds,
+                "end_time_seconds": end_time_seconds,
+                "reference_media_ids": list(reference_media_ids) if reference_media_ids else None,
+                "count": count,
+                "seed": seed,
+            },
+            idempotency_key=idempotency_key,
+            wait=wait,
+            wait_timeout_seconds=wait_timeout_seconds,
+            submit_coro_fn=lambda client: client.edit_video(
+                project_id,
+                video_media_id,
+                prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                start_time_seconds=start_time_seconds,
+                end_time_seconds=end_time_seconds,
+                references=list(reference_media_ids) if reference_media_ids else None,
+                count=count,
+                seed=seed,
+                allow_local_paths=False,
                 wait=False,
             ),
         )

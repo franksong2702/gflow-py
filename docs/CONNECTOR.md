@@ -2,7 +2,7 @@
 
 - **Endpoint**: `https://<your-host>.<tailnet>.ts.net:8443/mcp` (Streamable HTTP + OAuth 2.1 Authorization Code + PKCE)
 - **Host**: Local host running `gflow-mcp --transport http` (bound to `127.0.0.1:9421` behind Tailscale Funnel `:8443` or reverse proxy)
-- **Default Video Model**: **Omni 1.2 Flash** (`model="omni"`, `macaron_cookie_*` production RPCs; `3..15s` for T2V / I2V / R2V, `3..10s` for Start+End interpolation & Extend). Veo 3.1 (`"fast"`, `"quality"`, `"lite"`, `8s`) is also available.
+- **Default Video Model**: **Omni 1.2 Flash** (`model="omni"`, `macaron_cookie_*` production RPCs; `3..15s` for T2V / I2V / R2V, `3..10s` for Start+End interpolation & Extend, `3..15s` own-footage / clip conversational edit via `flow_edit_video`; `720p` and `360p` variants). Veo 3.1 (`"fast"`, `"quality"`, `"lite"`, `8s`) is also available.
 - **Default Image Model**: **Nano Banana Pro** (`model="pro"` = `GEM_PIX_2`; `"2"` / `"2.1"` = `BELUGA`; `"lite"` = `HARBOR_SEAL`).
 - **MCP Self-Serve Docs**: Also readable directly over MCP resources `gflow://docs/connector` and `gflow://docs/limits`, and programmatically via `flow_account_usage()`.
 
@@ -28,8 +28,13 @@
      Call `flow_create_upload_link(project_id=...)` -> `PUT <upload_url>?filename=frame01.png` with raw binary bytes -> returns JSON `{"status": "completed", "media_id": "..."}` immediately.
    - **Public URL Fetch (`<= 20 MiB`)**:
      Call `flow_upload_image(image_url="https://...", file_name="frame01.png")`.
-4. **Generate Video or Image with Timeout & Idempotency Protection**:
-   - Call `flow_generate_video(prompt=..., model="omni", duration_seconds=4, start_frame_media_id=..., idempotency_key="<unique-key>")`.
+   - **Own-Footage Video Upload (`<= 100 MiB`, for Conversational Editing)**:
+     - Inline base64 (`<= 15 MiB` decoded): `flow_upload_video(video_base64=..., file_name="clip.mp4")`.
+     - Large binary upload (`<= 100 MiB`, zero base64 token overhead): `flow_create_upload_link(kind="video", project_id=...)` -> `PUT <upload_url>?filename=clip.mp4` with raw video bytes -> returns `media_id`.
+     - Public URL fetch (`<= 100 MiB`): `flow_upload_video(video_url="https://...", file_name="clip.mp4")`.
+     - Then edit by prompt while preserving motion & audio: `flow_edit_video(video_media_id=..., prompt="Shift lighting to golden hour sunset, slow push-in", model="omni", idempotency_key="<unique-key>")`.
+4. **Generate, Extend, or Edit Video with Timeout & Idempotency Protection**:
+   - Call `flow_generate_video(prompt=..., model="omni", duration_seconds=4, start_frame_media_id=..., idempotency_key="<unique-key>")`, `flow_extend_video(video_media_id=..., prompt=..., model="omni", duration_seconds=10, idempotency_key="<unique-key>")`, or `flow_edit_video(video_media_id=..., prompt=..., model="omni", idempotency_key="<unique-key>")`.
    - Every generation call persists `job_id` before polling and soft-waits at most `wait_timeout_seconds` (**default `25s`, max `35s`**). If still rendering, it returns `{"status": "running", "job_id": "job_...", "media_ids": [...]}` before any client HTTP timeout.
    - Poll `flow_poll_media(job_id="job_...", wait=true)` until `status == "completed"`.
    - Retrying with the same `idempotency_key` within 7 days returns `idempotent_replay: true` and **never double-submits or double-charges credits**.
@@ -45,13 +50,14 @@ All values below are exact enforced server constants or empirically verified ups
 
 | Category | Item | Verified Value | Behavior When Exceeded |
 | --- | --- | --- | --- |
-| **Upload Limits** | `flow_upload_image(image_base64=...)` | **`<= 15 MiB`** (`15,728,640` decoded bytes; `/mcp` HTTP body cap = `24 MiB`) | Returns `error_code: "INVALID_INPUT"` (`retriable: false`) |
-| **Upload Limits** | `flow_create_upload_link` (`PUT /files/ul/{token}`) / `image_url` / `file_path` | **`<= 20 MiB`** (`20,971,520` bytes — Google Flow upstream image cap) | `PUT /files/ul` returns HTTP `413`; tool calls return `INVALID_INPUT` |
-| **Upload Limits** | Supported image formats | `image/png`, `image/jpeg`, `image/webp` (magic-byte validated) | Unsupported format returns `INVALID_INPUT` (or HTTP `415` on `/files/ul`) |
-| **Generation Caps** | `reference_media_ids` per video (`flow_generate_video` / `flow_extend_video`) | **Max `3` reference images** | `> 3` returns `INVALID_INPUT` |
-| **Generation Caps** | Video `aspect_ratio` (`flow_generate_video` / `flow_extend_video` / `flow_upsample_video`) | **`"16:9"`** (`1280×720` / `1920×1080` / `3840×2160`), **`"9:16"`** (`720×1280` / `1080×1920` / `2160×3840`), **`"1:1"`** (`720×720`) | Unsupported ratio returns `INVALID_INPUT`; `flow_upsample_video` auto-preserves source `9:16` / `16:9` when `aspect_ratio` is omitted |
-| **Generation Caps** | Batch `count` per call (`flow_generate_video` / `flow_generate_image`) | **`1..4` outputs per call** | `< 1` or `> 4` returns `INVALID_INPUT` |
-| **Generation Caps** | Omni 1.2 Flash `duration_seconds` | **`3..15`s** (T2V / Start-Frame / Refs), **`3..10`s** (Start+End / Extend) | Out-of-range integer returns `INVALID_INPUT` |
+| **Upload Limits** | `flow_upload_image(image_base64=...)` / `flow_upload_video(video_base64=...)` | **`<= 15 MiB`** (`15,728,640` decoded bytes; `/mcp` HTTP body cap = `24 MiB`) | Returns `error_code: "INVALID_INPUT"` (`retriable: false`) |
+| **Upload Limits** | `flow_create_upload_link(kind="image")` (`PUT /files/ul/{token}`) / `image_url` / `file_path` | **`<= 20 MiB`** (`20,971,520` bytes — Google Flow upstream image cap) | `PUT /files/ul` returns HTTP `413`; tool calls return `INVALID_INPUT` |
+| **Upload Limits** | `flow_create_upload_link(kind="video")` (`PUT /files/ul/{token}`) / `video_url` / `file_path` | **`<= 100 MiB`** (`104,857,600` bytes — Google Flow upstream Scotty video cap) | `PUT /files/ul` returns HTTP `413`; tool calls return `INVALID_INPUT` |
+| **Upload Limits** | Supported image / video formats | Images: `image/png`, `image/jpeg`, `image/webp`; Videos: `video/mp4`, `video/quicktime`, `video/webm`, `video/x-m4v`, `video/3gpp`, `video/x-msvideo` (magic-byte validated) | Unsupported format returns `INVALID_INPUT` (or HTTP `415` on `/files/ul`) |
+| **Generation Caps** | `reference_media_ids` per video (`flow_generate_video` / `flow_extend_video` / `flow_edit_video`) | **Max `3` reference images** | `> 3` returns `INVALID_INPUT` |
+| **Generation Caps** | Video `aspect_ratio` (`flow_generate_video` / `flow_extend_video` / `flow_edit_video` / `flow_upsample_video`) | **`"16:9"`** (`1280×720` / `1920×1080` / `3840×2160`), **`"9:16"`** (`720×1280` / `1080×1920` / `2160×3840`), **`"1:1"`** (`720×720`) | Unsupported ratio returns `INVALID_INPUT`; `flow_edit_video` & `flow_upsample_video` auto-preserve source orientation when `aspect_ratio` is omitted |
+| **Generation Caps** | Batch `count` per call (`flow_generate_video` / `flow_edit_video` / `flow_generate_image`) | **`1..4` outputs per call** | `< 1` or `> 4` returns `INVALID_INPUT` |
+| **Generation Caps** | Omni 1.2 Flash `duration_seconds` / edit clip window | **`3..15`s** (T2V / Start-Frame / Refs / Edit clip window), **`3..10`s** (Start+End / Extend; extend defaults to `8`s) | Out-of-range value returns `INVALID_INPUT` |
 | **Concurrency Caps** | **Google Flow parallel active video renders (per Google account)** | **`4` concurrent active video generations** | 5th simultaneous active render returns upstream `PUBLIC_ERROR_CONCURRENT_LIMIT_REACHED` (`51`) -> `error_code: "RATE_LIMITED"` (`retriable: true`) |
 | **Concurrency Caps** | **Signed HTTP upload streams (`/files/ul/{token}`)** | **`4` concurrent streams** (`_MAX_CONCURRENT_UPLOADS = 4`) | 5th simultaneous upload receives HTTP `429 Too Many Requests` (single-use JTI rolled back for retry) |
 | **Concurrency Caps** | **Signed HTTP download streams (`/files/dl/{token}`)** | **`4` concurrent streams** (`_MAX_CONCURRENT_DOWNLOADS = 4`) | 5th simultaneous download receives HTTP `429 Too Many Requests` (link stays valid for full 24h TTL) |

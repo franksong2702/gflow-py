@@ -240,11 +240,16 @@ class FileTransferConfig:
         project_id: str,
         *,
         label: str = "Reference image",
+        kind: str = "image",
         ttl: int = DEFAULT_UPLOAD_TTL_SECONDS,
     ) -> dict[str, Any]:
+        eff_kind = kind.strip().lower() if isinstance(kind, str) else "image"
+        if eff_kind not in ("image", "video"):
+            raise ValueError(f"Unsupported upload link kind {kind!r}; expected 'image' or 'video'.")
+        max_bytes = (100 * 1024 * 1024) if eff_kind == "video" else (20 * 1024 * 1024)
         token, payload = self.signer.sign(
             "ul",
-            {"project_id": project_id, "label": label},
+            {"project_id": project_id, "label": label, "kind": eff_kind},
             ttl=ttl,
         )
         jti = str(payload["jti"])
@@ -252,17 +257,25 @@ class FileTransferConfig:
         self.jti_store.register_issued(
             jti,
             float(payload["exp"]),
-            {"project_id": project_id, "label": label, "upload_url": url},
+            {"project_id": project_id, "label": label, "kind": eff_kind, "upload_url": url},
         )
+        if eff_kind == "video":
+            example = (
+                f'curl -fsSL -X PUT --data-binary @clip.mp4 "{url}?filename=clip.mp4" '
+                '-H "Content-Type: video/mp4"'
+            )
+        else:
+            example = (
+                f'curl -fsSL -X PUT --data-binary @frame.png "{url}?filename=frame.png" '
+                '-H "Content-Type: image/png"'
+            )
         return {
             "upload_id": jti,
             "upload_url": url,
             "project_id": project_id,
+            "kind": eff_kind,
             "expires_in_seconds": ttl,
             "expires_at": _epoch_to_iso(payload["exp"]),
-            "max_upload_bytes": 20 * 1024 * 1024,
-            "vm_direct_put_example": (
-                f'curl -fsSL -X PUT --data-binary @frame.png "{url}?filename=frame.png" '
-                '-H "Content-Type: image/png"'
-            ),
+            "max_upload_bytes": max_bytes,
+            "vm_direct_put_example": example,
         }
