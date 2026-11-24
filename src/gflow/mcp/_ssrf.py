@@ -43,6 +43,7 @@ __all__ = [
     "ImageFetchError",
     "Resolver",
     "fetch_public_image",
+    "fetch_public_media",
     "is_public_ip",
 ]
 
@@ -97,16 +98,17 @@ _BLOCKED_NETWORKS = tuple(
 
 
 class ImageFetchError(Exception):
-    """Generic, non-leaking failure of an SSRF-hardened image fetch.
+    """Generic, non-leaking failure of an SSRF-hardened media fetch.
 
     ``category`` is one of: ``invalid_url``, ``not_https``, ``userinfo``, ``dns_error``,
     ``blocked_address``, ``redirect_limit``, ``http_status``, ``too_large``, ``timeout``,
     ``network_error``.
     """
 
-    def __init__(self, category: str) -> None:
+    def __init__(self, category: str, *, prefix: str = "image_url") -> None:
         self.category = category
-        super().__init__(f"image_url fetch failed: {category}")
+        self.prefix = prefix
+        super().__init__(f"{prefix} fetch failed: {category}")
 
 
 def _to_ip(value: Any) -> _IPAddress:
@@ -185,7 +187,12 @@ def _parse_https_url(url: Union[str, httpx.URL]) -> httpx.URL:
     return parsed
 
 
-async def _prepare_target(url: Union[str, httpx.URL], resolver: Resolver) -> _Target:
+async def _prepare_target(
+    url: Union[str, httpx.URL],
+    resolver: Resolver,
+    *,
+    accept: str = "image/png,image/jpeg,image/webp,image/*;q=0.8",
+) -> _Target:
     parsed = _parse_https_url(url)
 
     try:
@@ -245,7 +252,7 @@ async def _prepare_target(url: Union[str, httpx.URL], resolver: Resolver) -> _Ta
     host_header = host_label if port == _DEFAULT_HTTPS_PORT else f"{host_label}:{port}"
     headers = {
         "Host": host_header,
-        "Accept": "image/png,image/jpeg,image/webp,image/*;q=0.8",
+        "Accept": accept,
         "Accept-Encoding": "identity",
         "User-Agent": "gflow-mcp-image-fetch/1",
     }
@@ -303,6 +310,7 @@ async def _fetch(
     timeout: float,
     resolver: Resolver,
     transport: Optional[httpx.AsyncBaseTransport],
+    accept: str = "image/png,image/jpeg,image/webp,image/*;q=0.8",
 ) -> bytes:
     client_kwargs: dict[str, Any] = {
         "follow_redirects": False,
@@ -319,7 +327,7 @@ async def _fetch(
     try:
         async with httpx.AsyncClient(**client_kwargs) as client:
             for hop in range(MAX_REDIRECTS + 1):
-                target = await _prepare_target(current, resolver)
+                target = await _prepare_target(current, resolver, accept=accept)
                 redirected = False
                 last_exc: Optional[Exception] = None
                 for request_url in target.request_urls:
@@ -359,6 +367,39 @@ async def _fetch(
     raise ImageFetchError("redirect_limit")  # pragma: no cover - loop always returns or raises
 
 
+async def fetch_public_media(
+    url: str,
+    *,
+    max_bytes: int,
+    timeout: float = 30.0,
+    accept: str = "*/*",
+    error_prefix: str = "media_url",
+    resolver: Optional[Resolver] = None,
+    transport: Optional[httpx.AsyncBaseTransport] = None,
+) -> bytes:
+    """Fetch ``url`` with full SSRF hardening and return the raw body (at most ``max_bytes`` bytes)."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+    try:
+        return await asyncio.wait_for(
+            _fetch(
+                url,
+                max_bytes=max_bytes,
+                timeout=timeout,
+                resolver=resolver or _default_resolver,
+                transport=transport,
+                accept=accept,
+            ),
+            timeout=timeout,
+        )
+    except ImageFetchError as exc:
+        if error_prefix != exc.prefix:
+            raise ImageFetchError(exc.category, prefix=error_prefix) from None
+        raise
+    except asyncio.TimeoutError:
+        raise ImageFetchError("timeout", prefix=error_prefix) from None
+
+
 async def fetch_public_image(
     url: str,
     *,
@@ -375,18 +416,12 @@ async def fetch_public_image(
     Raises:
         ImageFetchError: with a generic, non-leaking message ``image_url fetch failed: <category>``.
     """
-    if max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
-    try:
-        return await asyncio.wait_for(
-            _fetch(
-                url,
-                max_bytes=max_bytes,
-                timeout=timeout,
-                resolver=resolver or _default_resolver,
-                transport=transport,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise ImageFetchError("timeout") from None
+    return await fetch_public_media(
+        url,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        accept="image/png,image/jpeg,image/webp,image/*;q=0.8",
+        error_prefix="image_url",
+        resolver=resolver,
+        transport=transport,
+    )

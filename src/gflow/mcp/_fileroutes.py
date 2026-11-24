@@ -20,8 +20,9 @@ from starlette.responses import (
     Response,
 )
 
-from ..client import FlowClient
+from ..client import ALLOWED_VIDEO_MIMES, MAX_VIDEO_UPLOAD_BYTES, FlowClient
 from ..exceptions import GFlowError, NotFoundError
+from ..media_probe import detect_video_mime
 from ..paths import get_home_dir
 from ._filelink import FileLinkError, FileTransferConfig
 
@@ -210,21 +211,37 @@ def register_file_routes(
             )
 
         jti = str(payload.get("jti") or "")
+        kind = str(payload.get("kind") or "image").lower()
+        is_video = kind == "video"
         st = config.jti_store.status(jti)
         if st.get("status") == "completed":
             mid = html.escape(str(st.get("media_id") or ""))
+            noun = "Video" if is_video else "Image"
             return HTMLResponse(
                 "<!doctype html><html><body style='font-family:system-ui;padding:2rem'>"
-                "<h2>Image already uploaded</h2>"
+                f"<h2>{noun} already uploaded</h2>"
                 f"<p>Media ID: <code>{mid}</code></p>"
-                "<p>Return to your assistant — it can now use this image in Google Flow.</p>"
+                f"<p>Return to your assistant — it can now use this {noun.lower()} in Google Flow.</p>"
                 "</body></html>",
                 status_code=200,
                 headers=_HTML_SECURITY_HEADERS,
             )
 
-        label = html.escape(str(payload.get("label") or "Reference image"))
+        label = html.escape(str(payload.get("label") or ("Source video clip" if is_video else "Reference image")))
         pid = html.escape(str(payload.get("project_id") or ""))
+        accept_attr = (
+            "video/mp4,video/quicktime,video/webm,video/x-m4v,video/3gpp,video/x-msvideo"
+            if is_video
+            else "image/png,image/jpeg,image/webp"
+        )
+        btn_label = "Upload Video" if is_video else "Upload Image"
+        choose_prompt = "Please choose a video file first." if is_video else "Please choose an image file first."
+        fallback_ctype = "video/mp4" if is_video else "image/png"
+        uploading_msg = (
+            "Uploading video to Google Flow (Scotty upload + server processing)..."
+            if is_video
+            else "Uploading to Google Flow (running Enterprise reCAPTCHA + RPC)..."
+        )
         page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -236,8 +253,8 @@ def register_file_routes(
   <div style="background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:28px 32px;max-width:480px;width:92%;box-shadow:0 8px 24px rgba(15,23,42,0.06)">
     <h2 style="margin:0 0 6px;color:#0f172a">Upload to Google Flow</h2>
     <p style="margin:0 0 18px;color:#475569;font-size:0.95rem">{label} &middot; Project <code>{pid[:8]}...</code></p>
-    <input id="fileInput" type="file" accept="image/png,image/jpeg,image/webp" style="display:block;width:100%;margin-bottom:16px;font-size:0.95rem">
-    <button id="btn" type="button" style="width:100%;padding:11px 16px;font-size:1rem;font-weight:600;background:#0f172a;color:#fff;border:none;border-radius:8px;cursor:pointer">Upload Image</button>
+    <input id="fileInput" type="file" accept="{accept_attr}" style="display:block;width:100%;margin-bottom:16px;font-size:0.95rem">
+    <button id="btn" type="button" style="width:100%;padding:11px 16px;font-size:1rem;font-weight:600;background:#0f172a;color:#fff;border:none;border-radius:8px;cursor:pointer">{btn_label}</button>
     <div id="status" style="margin-top:16px;font-size:0.92rem;color:#334155;word-break:break-all"></div>
   </div>
 <script>
@@ -246,15 +263,15 @@ const inp = document.getElementById('fileInput');
 const st = document.getElementById('status');
 btn.addEventListener('click', async () => {{
   const f = inp.files && inp.files[0];
-  if (!f) {{ st.textContent = 'Please choose an image file first.'; return; }}
+  if (!f) {{ st.textContent = '{choose_prompt}'; return; }}
   btn.disabled = true;
-  st.textContent = 'Uploading to Google Flow (running Enterprise reCAPTCHA + RPC)...';
+  st.textContent = '{uploading_msg}';
   try {{
     const u = new URL(window.location.href);
     u.searchParams.set('filename', f.name);
     const resp = await fetch(u.toString(), {{
       method: 'POST',
-      headers: {{ 'Content-Type': f.type || 'image/png' }},
+      headers: {{ 'Content-Type': f.type || '{fallback_ctype}' }},
       body: f
     }});
     const text = await resp.text();
@@ -295,12 +312,18 @@ btn.addEventListener('click', async () => {{
         if not isinstance(jti, str) or not jti:
             return PlainTextResponse(_UPLOAD_REJECTED_MSG, status_code=403, headers=_CORS_ORIGIN)
 
+        kind = str(payload.get("kind") or "image").lower()
+        is_video = kind == "video"
+        max_bytes = MAX_VIDEO_UPLOAD_BYTES if is_video else MAX_UPLOAD_BYTES
+        limit_label = "100 MiB" if is_video else "20 MiB"
+        noun = "Video" if is_video else "Image"
+
         declared = request.headers.get("content-length")
         if declared is not None:
             try:
-                if int(declared) > MAX_UPLOAD_BYTES:
+                if int(declared) > max_bytes:
                     return PlainTextResponse(
-                        "Image exceeds the 20 MiB upload limit.",
+                        f"{noun} exceeds the {limit_label} upload limit.",
                         status_code=413,
                         headers=_CORS_ORIGIN,
                     )
@@ -324,9 +347,9 @@ btn.addEventListener('click', async () => {{
                 total = 0
                 async for chunk in request.stream():
                     total += len(chunk)
-                    if total > MAX_UPLOAD_BYTES:
+                    if total > max_bytes:
                         return PlainTextResponse(
-                            "Image exceeds the 20 MiB upload limit.",
+                            f"{noun} exceeds the {limit_label} upload limit.",
                             status_code=413,
                             headers=_CORS_ORIGIN,
                         )
@@ -339,6 +362,76 @@ btn.addEventListener('click', async () => {{
                         headers=_CORS_ORIGIN,
                     )
 
+                project_id = str(payload.get("project_id") or "")
+                hdr_ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+
+                if is_video:
+                    fname = _safe_filename(request.query_params.get("filename"), fallback="upload.mp4")
+                    detected_vid = detect_video_mime(raw_bytes)
+                    if detected_vid is None or (
+                        hdr_ctype
+                        and hdr_ctype not in ("application/octet-stream", "")
+                        and hdr_ctype not in ALLOWED_VIDEO_MIMES
+                    ):
+                        return PlainTextResponse(
+                            "Unsupported video format or MIME type. Supported: video/mp4, video/quicktime, video/webm, video/x-m4v, video/3gpp, video/x-msvideo.",
+                            status_code=415,
+                            headers=_CORS_ORIGIN,
+                        )
+                    mime, default_ext = detected_vid
+                    if "." not in fname:
+                        fname = f"{fname}{default_ext}"
+
+                    trim_start: float | None = None
+                    trim_end: float | None = None
+                    raw_ts = request.query_params.get("trim_start")
+                    raw_te = request.query_params.get("trim_end")
+                    if raw_ts is not None or raw_te is not None:
+                        try:
+                            if raw_ts is None or raw_te is None:
+                                raise ValueError("both required")
+                            trim_start = float(raw_ts)
+                            trim_end = float(raw_te)
+                            if trim_start < 0 or trim_end <= trim_start:
+                                raise ValueError("invalid range")
+                        except ValueError:
+                            return PlainTextResponse(
+                                "Invalid trim_start / trim_end query parameters.",
+                                status_code=400,
+                                headers=_CORS_ORIGIN,
+                            )
+
+                    wait_param = (request.query_params.get("wait") or "1").strip().lower()
+                    should_wait = wait_param not in ("0", "false", "no")
+                    client = await get_client()
+                    item = await client.upload_video(
+                        project_id,
+                        raw_bytes,
+                        file_name=fname,
+                        mime_type=mime,
+                        trim_start_seconds=trim_start,
+                        trim_end_seconds=trim_end,
+                        wait=should_wait,
+                        timeout=60.0,
+                    )
+                    dl_info = config.download_link_for_media(item.id)
+                    result = {
+                        "media_id": item.id,
+                        "project_id": item.project_id or project_id,
+                        "media_type": item.media_type,
+                        "media_status": item.status,
+                        "mime_type": mime,
+                        "width": item.width,
+                        "height": item.height,
+                        "duration_seconds": item.duration_seconds,
+                        "file_name": fname,
+                        "file_size_bytes": len(raw_bytes),
+                        **dl_info,
+                    }
+                    config.jti_store.commit(jti, float(payload["exp"]), result)
+                    committed = True
+                    return JSONResponse({"status": "completed", **result}, headers=_CORS_ORIGIN)
+
                 fname = _safe_filename(request.query_params.get("filename"), fallback="upload.png")
                 detected_mime: str | None = None
                 if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -348,7 +441,6 @@ btn.addEventListener('click', async () => {{
                 elif len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
                     detected_mime = "image/webp"
 
-                hdr_ctype = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
                 if hdr_ctype in ("image/jpg",):
                     hdr_ctype = "image/jpeg"
                 if detected_mime is None or (
@@ -363,7 +455,6 @@ btn.addEventListener('click', async () => {{
                     )
                 mime = detected_mime
 
-                project_id = str(payload.get("project_id") or "")
                 client = await get_client()
                 item = await client.upload_image(
                     project_id,

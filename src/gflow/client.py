@@ -53,6 +53,7 @@ from ._proto import (
     parse_project_contents,
     parse_project_list,
     parse_user_account,
+    parse_video_upload_response,
     resolve_image_aspect,
     resolve_image_model_key,
     resolve_video_aspect,
@@ -72,6 +73,7 @@ from .exceptions import (
     RateLimitedError,
     ValidationError,
 )
+from .media_probe import detect_video_mime
 from .paths import get_active_profile, get_default_output_dir, get_storage_state_path, load_context
 from .types import (
     AccountCredits,
@@ -83,6 +85,20 @@ from .types import (
     SceneClip,
     UserAccount,
 )
+
+MAX_VIDEO_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MiB exact Google Flow upstream video cap (`104,857,600` bytes)
+ALLOWED_VIDEO_MIMES = frozenset(
+    {
+        "video/mp4",
+        "video/quicktime",
+        "video/webm",
+        "video/x-m4v",
+        "video/3gpp",
+        "video/x-msvideo",
+    }
+)
+MIN_EDIT_VIDEO_SECONDS = 3.0
+MAX_EDIT_VIDEO_SECONDS = 15.0
 
 
 class FlowClient:
@@ -107,6 +123,7 @@ class FlowClient:
         self._rpc._on_auth_expired = self._recover_session
         self._scene_meta_cache: dict[str, tuple[str, str]] = {}
         self._cached_model_keys: dict[str, set[str]] | None = None
+        self._cached_service_tier: int | None = None
 
     async def _recover_session(self) -> httpx.Cookies:
         async with self._recovery_lock:
@@ -163,7 +180,10 @@ class FlowClient:
 
     async def get_credits(self) -> AccountCredits:
         raw = await self._rpc.call(RPC_CREDITS, [])
-        return parse_credits(raw)
+        credits = parse_credits(raw)
+        if credits.service_tier is not None:
+            self._cached_service_tier = credits.service_tier
+        return credits
 
     async def list_models(self, kind: str | None = None) -> list[ModelVariant]:
         raw = await self._rpc.call(RPC_MODELS, [])
@@ -335,12 +355,111 @@ class FlowClient:
             raise GenerationError(f"Image upload succeeded but returned no MediaItem: {raw}")
         return await self.get_media(items[0].id)
 
+    async def upload_video(
+        self,
+        project_id: str | None,
+        source: str | Path | bytes,
+        *,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        trim_start_seconds: float | None = None,
+        trim_end_seconds: float | None = None,
+        wait: bool = True,
+        poll_interval: float = 2.0,
+        timeout: float = 120.0,
+    ) -> MediaItem:
+        """Upload own video footage (MP4/MOV/WebM/M4V/3GP/AVI, <= 100 MiB) into Google Flow.
+
+        Uses Flow's Scotty resumable upload endpoint (``/upload/v1/flow/upload/video/{project_id}``).
+        When ``wait=True`` (default), polls until server-side processing completes and the video is
+        ready for ``edit_video`` / ``extend_video`` / download.
+        """
+        if (trim_start_seconds is None) != (trim_end_seconds is None):
+            raise ValidationError("Provide both trim_start_seconds and trim_end_seconds, or neither.")
+        if trim_start_seconds is not None and trim_end_seconds is not None:
+            if trim_start_seconds < 0:
+                raise ValidationError("trim_start_seconds must be >= 0.")
+            if trim_end_seconds <= trim_start_seconds:
+                raise ValidationError("trim_end_seconds must be greater than trim_start_seconds.")
+
+        if isinstance(source, (str, Path)):
+            path = Path(source).expanduser()
+            if not path.is_file():
+                raise ValidationError(f"Video file does not exist: {path}")
+            video_bytes = path.read_bytes()
+            fname = file_name or path.name
+            guessed, _ = mimetypes.guess_type(fname)
+            explicit_mime = mime_type or guessed
+        else:
+            video_bytes = source
+            fname = file_name or "upload.mp4"
+            explicit_mime = mime_type
+
+        if not video_bytes:
+            raise ValidationError("Uploaded video data is empty.")
+        if len(video_bytes) > MAX_VIDEO_UPLOAD_BYTES:
+            raise ValidationError(
+                f"Video size ({len(video_bytes)} bytes) exceeds Google Flow's 100 MiB ({MAX_VIDEO_UPLOAD_BYTES} bytes) upload limit."
+            )
+
+        clean_name = Path(fname.strip() or "upload.mp4").name
+        if len(clean_name) > 256:
+            raise ValidationError("file_name must not exceed 256 characters.")
+
+        detected = detect_video_mime(video_bytes)
+        if detected is None:
+            raise ValidationError(
+                "Unsupported video format (invalid magic bytes). Supported formats: MP4, MOV (QuickTime), WebM, M4V, 3GP, AVI."
+            )
+        detected_mime, default_ext = detected
+        if "." not in clean_name:
+            clean_name = f"{clean_name}{default_ext}"
+
+        if explicit_mime:
+            clean_mime = explicit_mime.split(";")[0].strip().lower()
+            if clean_mime not in ALLOWED_VIDEO_MIMES:
+                raise ValidationError(
+                    f"Unsupported video mime_type {explicit_mime!r}. Supported: {', '.join(sorted(ALLOWED_VIDEO_MIMES))}."
+                )
+        mtype = detected_mime
+
+        pid = await self.resolve_project_id(project_id)
+        raw = await self._rpc.upload_video_scotty(
+            pid,
+            video_bytes,
+            file_name=clean_name,
+            mime_type=mtype,
+            trim_start_seconds=trim_start_seconds,
+            trim_end_seconds=trim_end_seconds,
+        )
+        item = parse_video_upload_response(raw, project_id=pid, mime_type=mtype)
+        if item is None:
+            raise GenerationError(f"Video upload succeeded but returned no MediaItem: {raw}")
+        if not wait:
+            return item
+        polled = await self.poll_media(
+            [item.id],
+            wait=True,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+        return polled[0] if polled else item
+
     async def _ensure_media_id(self, project_id: str, ref_or_path: str | Path) -> str:
         """Accept either an existing Flow `media_id` UUID or a local image file path."""
         s = str(ref_or_path).strip()
         candidate_path = Path(s).expanduser()
         if candidate_path.is_file():
             uploaded = await self.upload_image(project_id, candidate_path)
+            return uploaded.id
+        return s
+
+    async def _ensure_video_media_id(self, project_id: str, ref_or_path: str | Path) -> str:
+        """Accept either an existing Flow video `media_id` UUID or a local video file path."""
+        s = str(ref_or_path).strip()
+        candidate_path = Path(s).expanduser()
+        if candidate_path.is_file():
+            uploaded = await self.upload_video(project_id, candidate_path, wait=True)
             return uploaded.id
         return s
 
@@ -494,6 +613,7 @@ class FlowClient:
             mode=pre_mode,
             is_portrait=is_portrait,
             duration_seconds=duration_seconds,
+            resolution=resolution,
             extra_valid_keys=valid_vid_keys,
         )
 
@@ -549,6 +669,7 @@ class FlowClient:
         model: str = "fast",
         aspect_ratio: str = "16:9",
         resolution: str = "720p",
+        duration_seconds: int = 8,
         start_frame_index: int | None = None,
         end_frame_index: int | None = None,
         references: list[str | Path] | None = None,
@@ -565,6 +686,8 @@ class FlowClient:
             model,
             mode="EXTEND_VIDEO",
             is_portrait=is_portrait,
+            duration_seconds=duration_seconds,
+            resolution=resolution,
             extra_valid_keys=valid_vid_keys,
         )
 
@@ -580,6 +703,7 @@ class FlowClient:
                 model=model,
                 aspect_ratio=aspect_ratio,
                 resolution=resolution,
+                duration_seconds=duration_seconds,
                 extend_video_media_id=video_media_id.strip(),
                 extend_start_frame=start_frame_index,
                 extend_end_frame=end_frame_index,
@@ -591,6 +715,165 @@ class FlowClient:
             return r_id, r_payload
 
         raw = await self._call_guarded("VIDEO_GENERATION", pid, _build_ext)
+        items = parse_generation_response(raw)
+        media_ids = [it.id for it in items] if items else expected_uuids
+        if not wait:
+            return items if items else [MediaItem(id=mid, project_id=pid, media_type="pending", status="running") for mid in media_ids]
+        return await self.poll_media(media_ids, wait=True, poll_interval=poll_interval, timeout=timeout)
+
+    async def edit_video(
+        self,
+        project_id: str | None,
+        video: str | Path,
+        prompt: str,
+        *,
+        model: str = "omni",
+        aspect_ratio: str | None = None,
+        resolution: str = "720p",
+        start_time_seconds: float | None = None,
+        end_time_seconds: float | None = None,
+        fps: int = 24,
+        references: list[str | Path] | None = None,
+        count: int = 1,
+        seed: int | None = None,
+        allow_local_paths: bool = True,
+        wait: bool = True,
+        poll_interval: float = 5.0,
+        timeout: float = 600.0,
+    ) -> list[MediaItem]:
+        """Conversationally edit an uploaded or generated 3-15s video clip via Omni 1.2 (`jIps6`).
+
+        ``video`` may be an existing Flow video ``media_id`` or a local video file path (auto-uploaded).
+        When ``aspect_ratio`` is omitted, the source clip's orientation is preserved automatically.
+        """
+        if not prompt.strip():
+            raise ValidationError("prompt must not be empty.")
+        if not 1 <= count <= 4:
+            raise ValidationError("Video generation count must be between 1 and 4.")
+        if references and len(references) > 3:
+            raise ValidationError("reference_media_ids supports at most 3 reference images.")
+        if fps <= 0:
+            raise ValidationError("fps must be a positive integer.")
+        if start_time_seconds is not None and start_time_seconds < 0:
+            raise ValidationError("start_time_seconds must be >= 0.")
+        if end_time_seconds is not None:
+            eff_s = start_time_seconds if start_time_seconds is not None else 0.0
+            if end_time_seconds <= eff_s:
+                raise ValidationError("end_time_seconds must be greater than start_time_seconds.")
+            span = end_time_seconds - eff_s
+            if span < MIN_EDIT_VIDEO_SECONDS or span > MAX_EDIT_VIDEO_SECONDS:
+                raise ValidationError(
+                    f"Edit clip window must be between {int(MIN_EDIT_VIDEO_SECONDS)} and "
+                    f"{int(MAX_EDIT_VIDEO_SECONDS)} seconds (got {span:.2f}s)."
+                )
+
+        resolve_video_resolution(resolution)
+        if aspect_ratio is not None and aspect_ratio.strip():
+            resolve_video_aspect(aspect_ratio)
+
+        valid_vid_keys = await self._get_valid_model_keys("video")
+        resolved_key, _ = resolve_video_model_key(
+            model,
+            mode="EDIT_VIDEO",
+            resolution=resolution,
+            service_tier=self._cached_service_tier,
+            extra_valid_keys=valid_vid_keys,
+        )
+
+        pid = await self.resolve_project_id(project_id)
+        src_str = str(video).strip()
+        if not src_str:
+            raise ValidationError("video must not be empty.")
+        uploaded_item: MediaItem | None = None
+        if allow_local_paths:
+            cand_path = Path(src_str).expanduser()
+            if cand_path.is_file():
+                uploaded_item = await self.upload_video(pid, cand_path, wait=True)
+                video_media_id = uploaded_item.id
+            else:
+                video_media_id = src_str
+        else:
+            video_media_id = src_str
+
+        src_media: MediaItem | None = uploaded_item
+        if src_media is None or not (src_media.width and src_media.height and src_media.duration_seconds):
+            try:
+                fetched = await self.get_media(video_media_id)
+                if fetched is not None:
+                    src_media = fetched
+            except Exception:
+                pass
+
+        eff_aspect = aspect_ratio.strip() if (aspect_ratio and aspect_ratio.strip()) else None
+        if eff_aspect is None:
+            if src_media is not None and src_media.width and src_media.height:
+                if src_media.height > src_media.width:
+                    eff_aspect = "9:16"
+                elif src_media.width == src_media.height:
+                    eff_aspect = "1:1"
+                else:
+                    eff_aspect = "16:9"
+            else:
+                eff_aspect = "16:9"
+        resolve_video_aspect(eff_aspect)
+
+        max_edit_sec = 10.0 if "edit_entry" in resolved_key else MAX_EDIT_VIDEO_SECONDS
+        src_duration = (
+            src_media.duration_seconds
+            if (src_media is not None and src_media.duration_seconds and src_media.duration_seconds > 0)
+            else None
+        )
+        eff_start = float(start_time_seconds) if start_time_seconds is not None else 0.0
+        eff_end: float | None
+        if end_time_seconds is not None:
+            eff_end = min(float(end_time_seconds), eff_start + max_edit_sec)
+        elif src_duration is not None and src_duration > 0:
+            if src_duration < eff_start:
+                raise ValidationError(
+                    f"start_time_seconds ({eff_start}s) exceeds source video duration ({src_duration}s)."
+                )
+            eff_end = min(eff_start + max_edit_sec, float(src_duration))
+            if (eff_end - eff_start) < 2.5:
+                raise ValidationError(
+                    f"Source video clip ({eff_end - eff_start:.2f}s) is shorter than the 3s minimum for Omni video editing."
+                )
+        else:
+            eff_end = None
+
+        edit_start_frame = round(eff_start * fps) if eff_end is not None else None
+        edit_end_frame = round(eff_end * fps) if eff_end is not None else None
+
+        ref_ids = (
+            [await self._ensure_media_id(pid, r) for r in (references or [])]
+            if allow_local_paths
+            else [str(r).strip() for r in (references or []) if str(r).strip()]
+        )
+        expected_uuids: list[str] = []
+
+        def _build_edit(tok: str | None) -> tuple[str, Any]:
+            nonlocal expected_uuids
+            r_id, r_payload, uuids = build_generate_video_req(
+                pid,
+                prompt,
+                model=model,
+                aspect_ratio=eff_aspect,
+                resolution=resolution,
+                count=count,
+                edit_video_media_id=video_media_id,
+                edit_start_frame=edit_start_frame,
+                edit_end_frame=edit_end_frame,
+                edit_start_time_seconds=eff_start if eff_end is not None else None,
+                edit_end_time_seconds=eff_end,
+                reference_media_ids=ref_ids if ref_ids else None,
+                recaptcha_token=tok,
+                seed=seed,
+                service_tier=self._cached_service_tier,
+                valid_video_model_keys=valid_vid_keys,
+            )
+            expected_uuids = uuids
+            return r_id, r_payload
+
+        raw = await self._call_guarded("VIDEO_GENERATION", pid, _build_edit)
         items = parse_generation_response(raw)
         media_ids = [it.id for it in items] if items else expected_uuids
         if not wait:

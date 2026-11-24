@@ -231,7 +231,7 @@ OMNI_VIDEO_ALIASES: frozenset[str] = frozenset(
 )
 
 _RAW_MACARON_RE = re.compile(
-    r"^macaron_cookie_(t2v|i2v|i2v_fl|r2v|extend)_([3-9]|1[0-5])s(_portrait|_landscape)?$"
+    r"^macaron_cookie_(?:(?:t2v|i2v|i2v_fl|r2v|extend)_([3-9]|1[0-5])s|edit(?:_entry)?)(?:_360p)?(?:_portrait|_landscape)?$"
 )
 
 
@@ -239,17 +239,28 @@ def _omni_oriented_key(
     base_key: str,
     *,
     is_portrait: bool,
+    is_360p: bool = False,
     extra_valid_keys: set[str] | frozenset[str] | None,
 ) -> str:
-    """Pick the orientation-specific Omni (``macaron_cookie_*``) model key.
+    """Pick the orientation- and resolution-specific Omni (``macaron_cookie_*``) model key.
 
-    Landscape keeps the bare base key (unchanged wire behaviour, no ``_landscape`` suffix).
-    Portrait prefers ``<base>_portrait``:
-
-    * live model catalog known -> use the portrait key only if the catalog lists it, otherwise fall back
-      to the base key (never raise: catalog contents cannot be verified offline);
-    * catalog unknown (``None`` / empty, i.e. offline) -> portrait key.
+    Landscape 720p keeps the bare base key (unchanged wire behaviour, no ``_landscape`` suffix).
+    Portrait 720p prefers ``<base>_portrait`` when listed (or offline).
+    360p prefers ``<base>_360p`` (matching Google Flow's live ``HTrJv`` catalog).
     """
+    if is_360p:
+        key_360 = f"{base_key}_360p"
+        if extra_valid_keys is None:
+            return key_360
+        candidates = (
+            (f"{base_key}_portrait_360p", f"{base_key}_360p_portrait", key_360, f"{base_key}_portrait", base_key)
+            if is_portrait
+            else (key_360, base_key)
+        )
+        for cand in candidates:
+            if cand in extra_valid_keys:
+                return cand
+        return key_360
     if not is_portrait:
         return base_key
     portrait_key = f"{base_key}_portrait"
@@ -286,19 +297,24 @@ def resolve_video_model_key(
     mode: str,
     is_portrait: bool = False,
     duration_seconds: int = 8,
+    resolution: str = "720p",
+    service_tier: int | None = None,
     extra_valid_keys: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, bool]:
     """Resolve friendly model alias -> `(videoModelKey, is_experimental_omni)`.
 
-    Modes: ``TEXT``, ``START_FRAME``, ``START_END_FRAMES``, ``REFERENCES``, ``EXTEND_VIDEO``, ``UPSAMPLE_VIDEO``.
+    Modes: ``TEXT``, ``START_FRAME``, ``START_END_FRAMES``, ``REFERENCES``, ``EXTEND_VIDEO``, ``EDIT_VIDEO``, ``UPSAMPLE_VIDEO``.
     Raises :class:`ValidationError` (`error_code="INVALID_INPUT"`) if ``model`` is unknown.
     """
     raw = model.strip()
     low = raw.lower()
+    is_360p = resolution.strip().lower() == "360p"
 
     if mode == "UPSAMPLE_VIDEO":
         if low in ("4k", "veo_3_1_upsampler_4k"):
             return "veo_3_1_upsampler_4k", False
+        if low in ("720p", "omni_upsampler_360p"):
+            return "omni_upsampler_360p", False
         if low in ("1080p", "veo_3_1_upsampler_1080p", "fast", "omni", "default", ""):
             return "veo_3_1_upsampler_1080p", False
         if extra_valid_keys and raw in extra_valid_keys and "upsampler" in low:
@@ -308,8 +324,24 @@ def resolve_video_model_key(
         )
 
     if low in OMNI_VIDEO_ALIASES:
+        if mode == "EDIT_VIDEO":
+            primary_base = "macaron_cookie_edit_entry" if service_tier == 1 else "macaron_cookie_edit"
+            fallback_base = "macaron_cookie_edit" if service_tier == 1 else "macaron_cookie_edit_entry"
+            preferred = f"{primary_base}_360p" if is_360p else primary_base
+            if extra_valid_keys is None or preferred in extra_valid_keys:
+                return preferred, False
+            candidates = (
+                (f"{fallback_base}_360p", primary_base, fallback_base)
+                if is_360p
+                else (fallback_base, primary_base)
+            )
+            for cand in candidates:
+                if cand in extra_valid_keys:
+                    return cand, False
+            return preferred, False
+
         if mode in ("START_END_FRAMES", "EXTEND_VIDEO"):
-            if not isinstance(duration_seconds, int) or not 3 <= duration_seconds <= 10:
+            if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int) or not 3 <= duration_seconds <= 10:
                 raise ValidationError(
                     f"Omni 1.2 Flash {mode} duration_seconds must be an integer between 3 and 10 "
                     f"(got {duration_seconds!r})."
@@ -319,11 +351,16 @@ def resolve_video_model_key(
             else:
                 base_key = f"macaron_cookie_extend_{duration_seconds}s"
             return (
-                _omni_oriented_key(base_key, is_portrait=is_portrait, extra_valid_keys=extra_valid_keys),
+                _omni_oriented_key(
+                    base_key,
+                    is_portrait=is_portrait,
+                    is_360p=is_360p,
+                    extra_valid_keys=extra_valid_keys,
+                ),
                 False,
             )
 
-        if not isinstance(duration_seconds, int) or not 3 <= duration_seconds <= 15:
+        if isinstance(duration_seconds, bool) or not isinstance(duration_seconds, int) or not 3 <= duration_seconds <= 15:
             raise ValidationError(
                 f"Omni 1.2 Flash {mode} duration_seconds must be an integer between 3 and 15 "
                 f"(got {duration_seconds!r})."
@@ -335,7 +372,12 @@ def resolve_video_model_key(
         else:
             base_key = f"macaron_cookie_t2v_{duration_seconds}s"
         return (
-            _omni_oriented_key(base_key, is_portrait=is_portrait, extra_valid_keys=extra_valid_keys),
+            _omni_oriented_key(
+                base_key,
+                is_portrait=is_portrait,
+                is_360p=is_360p,
+                extra_valid_keys=extra_valid_keys,
+            ),
             False,
         )
 
@@ -351,7 +393,8 @@ def resolve_video_model_key(
         # Caller passed a raw model key rather than a friendly alias: validate strictly.
         if extra_valid_keys is not None:
             if raw in extra_valid_keys:
-                return raw, low.startswith("abra_")
+                is_exp = low.startswith("abra_") and mode != "EDIT_VIDEO"
+                return raw, is_exp
             raise ValidationError(
                 f"Unsupported video model {model!r}. Valid aliases: 'omni' (Omni 1.2 Flash), "
                 "'fast', 'quality', 'lite' (Veo 3.1), or a model key from flow_list_models(kind='video')."
@@ -363,10 +406,16 @@ def resolve_video_model_key(
         if low.startswith(("veo_3_1_", "veo_3_0_", "veo_2_", "omni_upsampler")):
             return raw, False
         if low.startswith("abra_"):
-            return raw, True
+            return raw, (mode != "EDIT_VIDEO")
         raise ValidationError(
             f"Unsupported video model {model!r}. Valid aliases: 'omni' (Omni 1.2 Flash), "
             "'fast', 'quality', 'lite' (Veo 3.1), or a model key from flow_list_models(kind='video')."
+        )
+
+    if mode == "EDIT_VIDEO":
+        raise ValidationError(
+            f"Video editing (EDIT_VIDEO) is only supported by Omni models, not Veo tier {model!r}. "
+            "Use model='omni' (Omni 1.2 Flash) or a raw edit model key such as 'macaron_cookie_edit' / 'abra_edit'."
         )
 
     if mode == "START_END_FRAMES":
@@ -590,12 +639,18 @@ def build_generate_video_req(
     extend_video_media_id: str | None = None,
     extend_start_frame: int | None = None,
     extend_end_frame: int | None = None,
+    edit_video_media_id: str | None = None,
+    edit_start_frame: int | None = None,
+    edit_end_frame: int | None = None,
+    edit_start_time_seconds: float | None = None,
+    edit_end_time_seconds: float | None = None,
     upsample_video_media_id: str | None = None,
     scene_id: str | None = None,
     scene_position: int | None = None,
     workflow_id: str | None = None,
     recaptcha_token: str | None = None,
     seed: int | None = None,
+    service_tier: int | None = None,
     valid_video_model_keys: set[str] | frozenset[str] | None = None,
 ) -> tuple[str, list[Any], list[str]]:
     """Build the appropriate Boq video generation RPC & payload.
@@ -613,6 +668,8 @@ def build_generate_video_req(
 
     if upsample_video_media_id:
         mode = "UPSAMPLE_VIDEO"
+    elif edit_video_media_id:
+        mode = "EDIT_VIDEO"
     elif extend_video_media_id:
         mode = "EXTEND_VIDEO"
     elif start_frame_media_id and end_frame_media_id:
@@ -629,6 +686,8 @@ def build_generate_video_req(
         mode=mode,
         is_portrait=is_portrait,
         duration_seconds=duration_seconds,
+        resolution=resolution,
+        service_tier=service_tier,
         extra_valid_keys=valid_video_model_keys,
     )
 
@@ -691,6 +750,39 @@ def build_generate_video_req(
                 )
             )
             rpc_id = RPC_VIDEO_UPSAMPLE
+        elif mode == "EDIT_VIDEO":
+            refs = [_build_frame_input(rid) for rid in (reference_media_ids or [])]
+            src_vid = jspb_msg(
+                {
+                    2: edit_video_media_id,
+                    3: edit_start_frame,
+                    4: edit_end_frame,
+                    6: (
+                        duration_to_pb(edit_start_time_seconds)
+                        if edit_start_time_seconds is not None
+                        else None
+                    ),
+                    7: (
+                        duration_to_pb(edit_end_time_seconds)
+                        if edit_end_time_seconds is not None
+                        else None
+                    ),
+                }
+            )
+            items.append(
+                jspb_msg(
+                    {
+                        1: src_vid,
+                        2: text_input,
+                        3: model_key,
+                        4: aspect_code,
+                        5: dest,
+                        9: refs,
+                        13: res_msg,
+                    }
+                )
+            )
+            rpc_id = RPC_VIDEO_EDIT
         elif mode == "EXTEND_VIDEO":
             refs = [_build_frame_input(rid) for rid in (reference_media_ids or [])]
             src_vid = jspb_msg(
@@ -1206,10 +1298,39 @@ def parse_media_item(entry: Any) -> MediaItem | None:
                 vid_aspect_code = raw_v_asp
         v_meta = _safe_get(vid_box, 1)
         if isinstance(v_meta, list):
+            w_raw = _safe_get(v_meta, 0)
+            h_raw = _safe_get(v_meta, 1)
+            if (
+                isinstance(w_raw, int)
+                and not isinstance(w_raw, bool)
+                and isinstance(h_raw, int)
+                and not isinstance(h_raw, bool)
+                and w_raw > 0
+                and h_raw > 0
+            ):
+                width, height = w_raw, h_raw
+                dims_source = "reported"
             dur_pb = _safe_get(v_meta, 2)
             if isinstance(dur_pb, list) and dur_pb and isinstance(dur_pb[0], (int, float)):
                 nanos = float(dur_pb[1]) / 1e9 if len(dur_pb) > 1 and isinstance(dur_pb[1], (int, float)) else 0.0
                 duration_sec = round(float(dur_pb[0]) + nanos, 2)
+        if not video_url:
+            uploaded_box = _safe_get(vid_box, 4)
+            if isinstance(uploaded_box, list):
+                up_url = _safe_get(uploaded_box, 2)
+                if isinstance(up_url, str) and up_url.startswith("http"):
+                    video_url = up_url
+                    mime_type = mime_type or "video/mp4"
+        if not video_url or not thumb_url:
+            playback_box = _safe_get(vid_box, 5)
+            if isinstance(playback_box, list):
+                pb_urls = _safe_get(playback_box, 1)
+                if isinstance(pb_urls, list):
+                    if not video_url and isinstance(_safe_get(pb_urls, 0), str) and pb_urls[0].startswith("http"):
+                        video_url = pb_urls[0]
+                        mime_type = mime_type or "video/mp4"
+                    if not thumb_url and isinstance(_safe_get(pb_urls, 1), str) and pb_urls[1].startswith("http"):
+                        thumb_url = pb_urls[1]
         if width is None and height is None and vid_aspect_code in (0, 1, 2):
             dims_source = "inferred_from_aspect"
             eff_res = spec_res_code
@@ -1257,6 +1378,80 @@ def parse_media_item(entry: Any) -> MediaItem | None:
         thumbnail_url=thumb_url,
         created_at_epoch=created_epoch,
         error_message=err_msg,
+    )
+
+
+def _parse_duration_str(val: Any) -> float | None:
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and val > 0:
+        return round(float(val), 2)
+    if isinstance(val, str):
+        cleaned = val.strip()
+        if cleaned.endswith("s"):
+            cleaned = cleaned[:-1].strip()
+        try:
+            parsed = float(cleaned)
+            if math.isfinite(parsed) and parsed > 0:
+                return round(parsed, 2)
+        except ValueError:
+            pass
+    return None
+
+
+def parse_video_upload_response(
+    raw: Any,
+    *,
+    project_id: str | None = None,
+    mime_type: str = "video/mp4",
+) -> MediaItem | None:
+    """Parse JSON response returned by Google Flow's Scotty ``/upload/v1/flow/upload/video/{project_id}``."""
+    if not isinstance(raw, dict):
+        return None
+    media_obj = raw.get("media") if isinstance(raw.get("media"), dict) else {}
+    wf_obj = raw.get("workflow") if isinstance(raw.get("workflow"), dict) else {}
+
+    mid = raw.get("mediaId") or raw.get("media_id") or media_obj.get("name")
+    if not isinstance(mid, str) or not mid.strip():
+        return None
+    mid = mid.strip()
+
+    pid = (
+        media_obj.get("projectId")
+        or media_obj.get("project_id")
+        or wf_obj.get("projectId")
+        or wf_obj.get("project_id")
+        or project_id
+    )
+    wf_id = wf_obj.get("name") or media_obj.get("workflowId") or media_obj.get("workflow_id")
+
+    vid_obj = media_obj.get("video") if isinstance(media_obj.get("video"), dict) else {}
+    dims_obj = vid_obj.get("dimensions") if isinstance(vid_obj.get("dimensions"), dict) else {}
+    w_raw = dims_obj.get("width")
+    h_raw = dims_obj.get("height")
+    width = int(w_raw) if isinstance(w_raw, int) and not isinstance(w_raw, bool) and w_raw > 0 else None
+    height = int(h_raw) if isinstance(h_raw, int) and not isinstance(h_raw, bool) and h_raw > 0 else None
+    duration_sec = _parse_duration_str(dims_obj.get("length"))
+
+    meta_obj = media_obj.get("mediaMetadata") if isinstance(media_obj.get("mediaMetadata"), dict) else {}
+    status_obj = meta_obj.get("mediaStatus") if isinstance(meta_obj.get("mediaStatus"), dict) else {}
+    raw_status = str(status_obj.get("mediaGenerationStatus") or "").upper()
+    if "FAILED" in raw_status or "ERROR" in raw_status:
+        status = "failed"
+    elif "COMPLETE" in raw_status or "SUCCESS" in raw_status:
+        status = "completed"
+    else:
+        status = "running"
+
+    return MediaItem(
+        id=mid,
+        project_id=str(pid) if isinstance(pid, str) and pid else project_id,
+        workflow_id=str(wf_id) if isinstance(wf_id, str) and wf_id else None,
+        media_type="video",
+        status=status,
+        mime_type=mime_type,
+        width=width,
+        height=height,
+        dimensions_source="reported" if (width is not None and height is not None) else None,
+        duration_seconds=duration_sec,
     )
 
 

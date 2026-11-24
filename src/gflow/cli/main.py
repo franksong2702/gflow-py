@@ -419,6 +419,43 @@ def cmd_upload(state: CliState, image_path: str, project: str | None) -> None:
     console.print(f"[bold green]Uploaded image![/bold green] Media ID: [cyan]{data['id']}[/cyan]")
 
 
+@cli.command("upload-video")
+@click.argument("video_path", type=click.Path(exists=True))
+@click.option("-P", "--project", default=None, help="Project ID (default: active project).")
+@click.option("--trim-start", default=None, type=float, help="Optional trim start in seconds.")
+@click.option("--trim-end", default=None, type=float, help="Optional trim end in seconds.")
+@click.option("--wait/--no-wait", default=True, show_default=True, help="Wait for server-side video processing.")
+@click.pass_obj
+def cmd_upload_video(
+    state: CliState,
+    video_path: str,
+    project: str | None,
+    trim_start: float | None,
+    trim_end: float | None,
+    wait: bool,
+) -> None:
+    """Upload a local video clip (MP4/MOV/WebM, <= 100 MiB) into a Google Flow project."""
+    async def _do() -> dict[str, Any]:
+        async with state.make_client() as client:
+            item = await client.upload_video(
+                project,
+                video_path,
+                trim_start_seconds=trim_start,
+                trim_end_seconds=trim_end,
+                wait=wait,
+            )
+            return item.to_dict()
+
+    data = _run(_do())
+    if state.as_json:
+        _emit_json(data)
+        return
+    dur_str = f" ({data['duration_seconds']}s)" if data.get("duration_seconds") else ""
+    console.print(
+        f"[bold green]Uploaded video![/bold green] Media ID: [cyan]{data['id']}[/cyan] ({data['status']}){dur_str}"
+    )
+
+
 @cli.command("frame-save")
 @click.argument("video_media_id")
 @click.option("--at", "timestamp", default=0.0, show_default=True, type=float, help="Timestamp in seconds.")
@@ -580,8 +617,10 @@ def cmd_generate_video(
 @click.argument("video_media_id")
 @click.argument("prompt")
 @click.option("-P", "--project", default=None, help="Project ID (default: active project).")
-@click.option("--model", default="fast", show_default=True, help="Model: fast, quality, lite, or raw key.")
+@click.option("--model", default="fast", show_default=True, help="Model: fast, quality, lite, omni (Omni 1.2 Flash), or raw key.")
 @click.option("--aspect", default="16:9", show_default=True, help="Aspect ratio: 16:9 or 9:16.")
+@click.option("--resolution", default="720p", show_default=True, help="Resolution: 720p or 360p.")
+@click.option("--duration", default=8, show_default=True, type=int, help="Extension duration in seconds (3..10 for Omni 1.2 Flash).")
 @click.option("--ref", "refs", multiple=True, help="Optional reference image media_id or path.")
 @click.option("--wait/--no-wait", default=True, show_default=True)
 @click.option("-d", "--download", is_flag=True, help="Download extended MP4 locally.")
@@ -594,12 +633,14 @@ def cmd_extend(
     project: str | None,
     model: str,
     aspect: str,
+    resolution: str,
+    duration: int,
     refs: tuple[str, ...],
     wait: bool,
     download: bool,
     output: str | None,
 ) -> None:
-    """Extend an existing Flow video clip seamlessly with Veo 3.1 Video Extension."""
+    """Extend an existing Flow video clip seamlessly with Veo 3.1 or Omni 1.2 Flash (3..10s)."""
     async def _do() -> list[dict[str, Any]]:
         async with state.make_client() as client:
             items = await client.extend_video(
@@ -608,6 +649,8 @@ def cmd_extend(
                 prompt,
                 model=model,
                 aspect_ratio=aspect,
+                resolution=resolution,
+                duration_seconds=duration,
                 references=list(refs) if refs else None,
                 wait=wait,
             )
@@ -628,6 +671,77 @@ def cmd_extend(
         console.print(f"[bold green]Extended Video:[/bold green] [cyan]{r['id']}[/cyan] ({r['status']})")
         if r.get("saved_path"):
             console.print(f"  Saved MP4: {r['saved_path']}")
+
+
+@cli.command("edit")
+@click.argument("video")
+@click.argument("prompt")
+@click.option("-P", "--project", default=None, help="Project ID (default: active project).")
+@click.option("--model", default="omni", show_default=True, help="Model: omni (Omni 1.2 Flash) or raw edit model key.")
+@click.option("--aspect", default=None, help="Aspect ratio: 16:9, 9:16, or 1:1 (default: preserve source).")
+@click.option("--resolution", default="720p", show_default=True, help="Resolution: 720p or 360p.")
+@click.option("--start-time", default=None, type=float, help="Optional clip start time in seconds.")
+@click.option("--end-time", default=None, type=float, help="Optional clip end time in seconds (3..15s window).")
+@click.option("--ref", "refs", multiple=True, help="Optional reference image media_id or path (up to 3).")
+@click.option("-n", "--count", default=1, show_default=True, type=int, help="Number of edited outputs (1..4).")
+@click.option("--seed", default=None, type=int, help="Optional RNG seed.")
+@click.option("--wait/--no-wait", default=True, show_default=True)
+@click.option("-d", "--download", is_flag=True, help="Download edited MP4 locally.")
+@click.option("-o", "--output", default=None)
+@click.pass_obj
+def cmd_edit(
+    state: CliState,
+    video: str,
+    prompt: str,
+    project: str | None,
+    model: str,
+    aspect: str | None,
+    resolution: str,
+    start_time: float | None,
+    end_time: float | None,
+    refs: tuple[str, ...],
+    count: int,
+    seed: int | None,
+    wait: bool,
+    download: bool,
+    output: str | None,
+) -> None:
+    """Conversationally edit an uploaded or generated 3-15s video clip (media_id or local video path)."""
+    async def _do() -> list[dict[str, Any]]:
+        async with state.make_client() as client:
+            items = await client.edit_video(
+                project,
+                video,
+                prompt,
+                model=model,
+                aspect_ratio=aspect,
+                resolution=resolution,
+                start_time_seconds=start_time,
+                end_time_seconds=end_time,
+                references=list(refs) if refs else None,
+                count=count,
+                seed=seed,
+                wait=wait,
+            )
+            out_list = []
+            for it in items:
+                d = it.to_dict()
+                if download and it.download_url:
+                    saved = await client.download_media(it, output_path=output)
+                    d["saved_path"] = str(saved)
+                out_list.append(d)
+            return out_list
+
+    results = _run(_do())
+    if state.as_json:
+        _emit_json(results)
+        return
+    for r in results:
+        console.print(f"[bold green]Edited Video:[/bold green] [cyan]{r['id']}[/cyan] ({r['status']})")
+        if r.get("saved_path"):
+            console.print(f"  Saved MP4: {r['saved_path']}")
+        elif r.get("download_url"):
+            console.print(f"  MP4 URL: {r['download_url']}")
 
 
 @cli.command("upsample")

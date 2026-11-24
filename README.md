@@ -20,7 +20,7 @@ Turn Google Flow's web creative studio (**Veo 3.1**, **Omni 1.2 Flash**, **Nano 
     - Start-Frame Image-to-Video (`eb1hJf`)
     - **Start + End Frame Interpolation** (`nprQif`)
     - **Multi-Reference Ingredients-to-Video (R2V)** (`MZZa6b`)
-    - **Video Extend** (`fZytfe`) & **1080p / 4K Upsample** (`p0UkFb`)
+    - **Video Extend** (`fZytfe`, configurable `3..10s` on Omni 1.2 Flash), **Own-Footage Video Upload & Conversational Edit** (Scotty `/upload/v1/flow/upload/video/{project_id}` + `jIps6`, 3–15s clips), & **1080p / 4K Upsample** (`p0UkFb`)
     - **Video Frame Extraction** (`fdJi4e` — capture any timestamp as a reusable image `media_id`)
   - **Scene Builder**: Create multi-clip timelines, append/insert clips, reorder, trim in/out timestamps, remove clips, and render/stitch continuous **MP4 exports** (`GjQLTd` + `IxdSwd`).
 - **Dual-Mode MCP Server (`gflow-mcp`)**:
@@ -80,6 +80,15 @@ gflow frame-save <shot1_media_id> --at 7.8
 # Start + End frame interpolation
 gflow generate video "Smooth whip-pan transition from alley to rooftop skyline" \
   --start-frame <frame_a_id> --end-frame <frame_b_id> --wait
+
+# Extend an existing clip up to 10s with Omni 1.2 Flash
+gflow extend <shot1_media_id> "Camera pans up to reveal rooftop fireworks" \
+  --model omni --duration 10 --wait -d -o shot1_ext.mp4
+
+# Upload your own 3-15s footage and edit lighting/camera conversationally
+gflow upload-video ./my_footage.mp4
+gflow edit ./my_footage.mp4 "Shift lighting to warm golden hour sunset, smooth slow push-in" \
+  --model omni --wait -d -o my_footage_edited.mp4
 
 # Upsample a clip to 1080p or 4K
 gflow upsample <shot1_media_id> --target 1080p --wait -o shot1_1080p.mp4

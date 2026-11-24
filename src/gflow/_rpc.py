@@ -6,6 +6,7 @@ import base64
 import json
 import random
 import re
+import urllib.parse
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -28,6 +29,7 @@ from .exceptions import (
 
 FLOW_BASE_URL = "https://flow.google.com"
 BATCHEXECUTE_PATH = "/_/AiSandboxAngularFrontend/data/batchexecute"
+UPLOAD_VIDEO_PATH_PREFIX = "/upload/v1/flow/upload/video/"
 
 _DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -121,6 +123,9 @@ PUBLIC_ERROR_CODE_MAP: dict[int, str] = {
     76: "PUBLIC_ERROR_USER_BANNED",
 }
 
+_PUBLIC_ERROR_NAME_TO_CODE: dict[str, int] = {
+    name: code for code, name in PUBLIC_ERROR_CODE_MAP.items()
+}
 _QUOTA_PUBLIC_CODES: frozenset[int] = frozenset({2, 32, 34, 48, 57, 70, 71})
 _RATE_LIMIT_PUBLIC_CODES: frozenset[int] = frozenset({3, 4, 5, 9, 28, 49, 50, 51})
 _UPSTREAM_PUBLIC_CODES: frozenset[int] = frozenset({0, 27, 35, 42, 54, 58, 72})
@@ -248,6 +253,9 @@ def _extract_boq_error_signals(detail: Any) -> tuple[int | None, str | None, str
 def _classify_rpc_error(rpc_id: str, code: int | None, detail: Any) -> Exception:
     """Map upstream Boq/gRPC status codes and `PublicAitkError` wire payloads to canonical gflow exceptions."""
     pub_code, pub_name, err_reason = _extract_boq_error_signals(detail)
+    if pub_code is None and err_reason and err_reason in _PUBLIC_ERROR_NAME_TO_CODE:
+        pub_code = _PUBLIC_ERROR_NAME_TO_CODE[err_reason]
+        pub_name = err_reason
     base_details: dict[str, Any] = {"rpc_id": rpc_id}
     if code is not None:
         base_details["upstream_code"] = code
@@ -331,6 +339,7 @@ def _classify_rpc_error(rpc_id: str, code: int | None, detail: Any) -> Exception
             "requests_throttled",
             "stream_error_rate_limit",
             "too_much_traffic",
+            "unusual_activity",
         )
     ):
         return RateLimitedError(
@@ -559,6 +568,208 @@ class FlowHttpRpc:
                     retry_on_xsrf=False,
                 )
             raise
+
+    async def upload_video_scotty(
+        self,
+        project_id: str,
+        video_bytes: bytes,
+        *,
+        file_name: str = "upload.mp4",
+        mime_type: str = "video/mp4",
+        trim_start_seconds: float | None = None,
+        trim_end_seconds: float | None = None,
+        retry_on_xsrf: bool = True,
+    ) -> dict[str, Any]:
+        """Upload a local video clip to Google Flow via the Scotty resumable upload endpoint.
+
+        Mirrors ``nHb`` / ``wHb`` / ``JN`` in ``AiSandboxAngularFrontend``:
+        ``POST /upload/v1/flow/upload/video/{project_id}`` (start) followed by ``upload, finalize``.
+        """
+        wiz = await self.bootstrap()
+        start_url = f"{FLOW_BASE_URL}{UPLOAD_VIDEO_PATH_PREFIX}{urllib.parse.quote(project_id, safe='')}"
+        base_headers: dict[str, str] = {
+            "X-Framework-Xsrf-Token": wiz.xsrf_token,
+            "Slug": urllib.parse.quote(file_name, safe=""),
+        }
+        if trim_start_seconds is not None and trim_end_seconds is not None:
+            base_headers["x-trim-start"] = str(round(trim_start_seconds * 1000))
+            base_headers["x-trim-end"] = str(round(trim_end_seconds * 1000))
+
+        start_headers = {
+            **base_headers,
+            "X-Goog-Upload-Protocol": "resumable",
+            "X-Goog-Upload-Command": "start",
+            "X-Goog-Upload-Header-Content-Length": str(len(video_bytes)),
+            "X-Goog-Upload-Header-Content-Type": mime_type,
+        }
+        upload_timeout = max(self._timeout, 120.0)
+        try:
+            r_start = await self._client.post(
+                start_url,
+                headers=start_headers,
+                content=b"",
+                timeout=upload_timeout,
+            )
+        except httpx.HTTPError as exc:
+            raise RpcError(
+                f"Network error starting Google Flow Scotty video upload: {exc}",
+                rpc_id="SCOTTY_VIDEO_UPLOAD",
+                error_code=ERR_UPSTREAM_ERROR,
+                retriable=True,
+            ) from exc
+
+        if r_start.status_code in (401, 403) and retry_on_xsrf:
+            await self.bootstrap(force=True)
+            return await self.upload_video_scotty(
+                project_id,
+                video_bytes,
+                file_name=file_name,
+                mime_type=mime_type,
+                trim_start_seconds=trim_start_seconds,
+                trim_end_seconds=trim_end_seconds,
+                retry_on_xsrf=False,
+            )
+        if r_start.status_code == 401:
+            if self._on_auth_expired is not None:
+                recovered_jar = await self._on_auth_expired()
+                await self.replace_cookies(recovered_jar)
+                await self.bootstrap(force=True, _allow_recover=False)
+                return await self.upload_video_scotty(
+                    project_id,
+                    video_bytes,
+                    file_name=file_name,
+                    mime_type=mime_type,
+                    trim_start_seconds=trim_start_seconds,
+                    trim_end_seconds=trim_end_seconds,
+                    retry_on_xsrf=False,
+                )
+            raise AuthError(
+                "AUTH_EXPIRED: Google Flow rejected session credentials on Scotty video upload (HTTP 401). Run 'gflow login'."
+            )
+        if r_start.status_code == 429:
+            raise RateLimitedError("Google Flow rate-limited Scotty video upload (HTTP 429).")
+        if r_start.status_code == 404:
+            raise NotFoundError(f"Google Flow project or video upload endpoint not found (HTTP 404): {project_id}")
+        if r_start.status_code in (400, 413, 415):
+            raise ValidationError(
+                f"Google Flow rejected video upload metadata (HTTP {r_start.status_code}): {r_start.text[:300]}",
+                error_code=ERR_INVALID_INPUT,
+                retriable=False,
+            )
+        if r_start.status_code >= 400:
+            raise RpcError(
+                f"Google Flow Scotty video upload start failed (HTTP {r_start.status_code}): {r_start.text[:300]}",
+                rpc_id="SCOTTY_VIDEO_UPLOAD",
+                code=r_start.status_code,
+                error_code=ERR_UPSTREAM_ERROR,
+                retriable=r_start.status_code >= 500,
+            )
+
+        upload_status = (r_start.headers.get("x-goog-upload-status") or "").lower()
+        if upload_status == "final":
+            try:
+                parsed = r_start.json()
+            except ValueError as exc:
+                raise RpcError(
+                    f"Malformed JSON from Scotty video upload: {r_start.text[:300]}",
+                    rpc_id="SCOTTY_VIDEO_UPLOAD",
+                ) from exc
+            if isinstance(parsed, dict):
+                return parsed
+            raise RpcError("Unexpected non-object JSON from Scotty video upload.", rpc_id="SCOTTY_VIDEO_UPLOAD")
+
+        upload_url = r_start.headers.get("x-goog-upload-url")
+        if not upload_url or upload_status != "active":
+            raise RpcError(
+                f"Scotty video upload start did not return an active upload URL (status={upload_status!r}).",
+                rpc_id="SCOTTY_VIDEO_UPLOAD",
+                error_code=ERR_UPSTREAM_ERROR,
+                retriable=True,
+            )
+
+        gran_raw = r_start.headers.get("x-goog-upload-chunk-granularity")
+        try:
+            granularity = max(1, int(gran_raw)) if gran_raw else 1
+        except ValueError:
+            granularity = 1
+        max_chunk = (1073741824 // granularity) * granularity  # matches JN.prototype.Pg (~1 GiB)
+        chunk_size = max(granularity, max_chunk)
+
+        total = len(video_bytes)
+        offset = 0
+        resp: httpx.Response | None = None
+        while True:
+            end = min(offset + chunk_size, total)
+            is_final = end >= total
+            chunk = video_bytes[offset:end]
+            cmd = "upload, finalize" if is_final else "upload"
+            chunk_headers = {
+                **base_headers,
+                "X-Goog-Upload-Command": cmd,
+                "X-Goog-Upload-Offset": str(offset),
+            }
+            try:
+                resp = await self._client.post(
+                    upload_url,
+                    headers=chunk_headers,
+                    content=chunk,
+                    timeout=upload_timeout,
+                )
+            except httpx.HTTPError as exc:
+                raise RpcError(
+                    f"Network error transferring video bytes to Google Flow Scotty: {exc}",
+                    rpc_id="SCOTTY_VIDEO_UPLOAD",
+                    error_code=ERR_UPSTREAM_ERROR,
+                    retriable=True,
+                ) from exc
+
+            if resp.status_code == 401:
+                raise AuthError(
+                    "AUTH_EXPIRED: Google Flow rejected session credentials during Scotty video upload (HTTP 401)."
+                )
+            if resp.status_code == 429:
+                raise RateLimitedError("Google Flow rate-limited Scotty video upload (HTTP 429).")
+            if resp.status_code in (400, 413, 415):
+                raise ValidationError(
+                    f"Google Flow rejected uploaded video (HTTP {resp.status_code}): {resp.text[:300]}",
+                    error_code=ERR_INVALID_INPUT,
+                    retriable=False,
+                )
+            if resp.status_code >= 400:
+                raise RpcError(
+                    f"Google Flow Scotty video upload failed (HTTP {resp.status_code}): {resp.text[:300]}",
+                    rpc_id="SCOTTY_VIDEO_UPLOAD",
+                    code=resp.status_code,
+                    error_code=ERR_UPSTREAM_ERROR,
+                    retriable=resp.status_code >= 500,
+                )
+
+            chunk_status = (resp.headers.get("x-goog-upload-status") or "").lower()
+            if chunk_status == "final" or is_final:
+                break
+            if chunk_status != "active":
+                raise RpcError(
+                    f"Unexpected Scotty upload status {chunk_status!r} at offset {offset}/{total}.",
+                    rpc_id="SCOTTY_VIDEO_UPLOAD",
+                    error_code=ERR_UPSTREAM_ERROR,
+                    retriable=True,
+                )
+            offset = end
+
+        assert resp is not None
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise RpcError(
+                f"Malformed JSON response from Scotty video upload: {resp.text[:300]}",
+                rpc_id="SCOTTY_VIDEO_UPLOAD",
+            ) from exc
+        if not isinstance(data, dict):
+            raise RpcError(
+                f"Unexpected Scotty video upload response type: {type(data).__name__}",
+                rpc_id="SCOTTY_VIDEO_UPLOAD",
+            )
+        return data
 
     async def download_bytes(self, url: str) -> tuple[bytes, str | None]:
         try:

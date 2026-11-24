@@ -6,21 +6,24 @@ All numbers below are **exact enforced or empirically verified values** (never e
 
 ---
 
-## 1. Image Upload Size, Format, and Reference Limits (`P0-1`, `P2-6`)
+## 1. Image & Video Upload Size, Format, and Reference Limits (`P0-1`, `P2-6`)
 
-Remote VM callers can upload keyframes, start/end frames, and character/style reference images **directly without human browser relay** using any of three paths:
+Remote VM callers can upload keyframes, reference images, and own 3–15s video footage **directly without human browser relay** using any of three paths:
 
-| Upload Path | Max Image Size | Accepted Formats & Validation | Filename Limit | Notes |
+| Upload Path | Max Size | Accepted Formats & Validation | Filename Limit | Notes |
 | --- | --- | --- | --- | --- |
 | `flow_upload_image(image_base64=..., file_name=...)` | **15 MiB** (`15,728,640` decoded bytes; ~20 MiB base64 text) | `image/png` (`.png`), `image/jpeg` (`.jpg`/`.jpeg`), `image/webp` (`.webp`) — **magic-byte enforced** (`\x89PNG\r\n\x1a\n`, `\xff\xd8\xff`, `RIFF....WEBP`) | **256 characters** | Accepts raw base64 or `data:image/...;base64,...`. Exceeding 15 MiB or non-PNG/JPEG/WebP magic bytes immediately returns `INVALID_INPUT`. |
-| `flow_create_upload_link` -> `PUT` / `POST /files/ul/{token}?filename=...` | **20 MiB** (`20,971,520` raw bytes — exact Google Flow upstream image cap) | `image/png`, `image/jpeg`, `image/webp` — magic-byte + `Content-Type` enforced | **120 characters** (auto-sanitized) | Single-use HMAC-SHA256 URL (**TTL = 1,800s / 30 minutes**), zero base64 token overhead. `> 20,971,520` bytes returns HTTP `413`; unsupported format returns HTTP `415`; replay after commit returns HTTP `403`. |
-| `flow_upload_image(image_url=...)` / `flow_upload_image(file_path=...)` | **20 MiB** (`20,971,520` bytes) | `image/png`, `image/jpeg`, `image/webp` — magic-byte enforced | **256 characters** | `image_url` fetches over HTTP/HTTPS (`30s` timeout); `file_path` reads from server host local disk (missing file returns `NOT_FOUND`). |
+| `flow_create_upload_link(kind="image")` -> `PUT` / `POST /files/ul/{token}?filename=...` | **20 MiB** (`20,971,520` raw bytes — exact Google Flow upstream image cap) | `image/png`, `image/jpeg`, `image/webp` — magic-byte + `Content-Type` enforced | **120 characters** (auto-sanitized) | Single-use HMAC-SHA256 URL (**TTL = 1,800s / 30 minutes**), zero base64 token overhead. `> 20,971,520` bytes returns HTTP `413`; unsupported format returns HTTP `415`; replay after commit returns HTTP `403`. |
+| `flow_upload_image(image_url=...)` / `flow_upload_image(file_path=...)` | **20 MiB** (`20,971,520` bytes) | `image/png`, `image/jpeg`, `image/webp` — magic-byte enforced | **256 characters** | `image_url` fetches over HTTPS (SSRF-hardened in public HTTP mode); `file_path` is stdio-only. |
+| `flow_upload_video(video_base64=..., file_name=...)` | **15 MiB** (`15,728,640` decoded bytes) | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-m4v`, `video/3gpp`, `video/x-msvideo` — **magic-byte enforced** | **256 characters** | Uploads via Google Flow Scotty resumable endpoint (`/upload/v1/flow/upload/video/{project_id}`) and soft-waits for server transcoding. |
+| `flow_create_upload_link(kind="video")` -> `PUT` / `POST /files/ul/{token}?filename=...` | **100 MiB** (`104,857,600` raw bytes — exact Google Flow upstream video cap) | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-m4v`, `video/3gpp`, `video/x-msvideo` — magic-byte + `Content-Type` enforced | **120 characters** (auto-sanitized) | Single-use HMAC-SHA256 URL (**TTL = 1,800s / 30 minutes**). Supports optional `?trim_start=...&trim_end=...&wait=1`. `> 104,857,600` bytes returns HTTP `413`; unsupported format returns HTTP `415`. |
+| `flow_upload_video(video_url=...)` / `flow_upload_video(file_path=...)` | **100 MiB** (`104,857,600` bytes) | `video/mp4`, `video/quicktime`, `video/webm`, `video/x-m4v`, `video/3gpp`, `video/x-msvideo` — magic-byte enforced | **256 characters** | `video_url` fetches over HTTPS (SSRF-hardened in public HTTP mode); `file_path` is stdio-only. |
 
 ### Per-Call Media & Reference Caps
-- **Default Video Model (`flow_generate_video` / `flow_extend_video`)**: **`Omni 1.2 Flash`** (`model="omni"`, default; `macaron_cookie_*` family via standard production video RPCs) — supports integer durations **`3..15` seconds** (`default=4`) for Text-to-Video (`macaron_cookie_t2v_*`), Start-Frame (`macaron_cookie_i2v_*`), and Multi-Reference (`macaron_cookie_r2v_*`), and **`3..10` seconds** for Start+End-Frame Interpolation (`macaron_cookie_i2v_fl_*`) and Extend (`macaron_cookie_extend_*`). Veo 3.1 (`model="fast" | "quality" | "lite"`, `8s`) is also supported.
-- **`reference_media_ids` (`flow_generate_video`)**: Maximum **`3`** reference images per video generation (`> 3` raises `INVALID_INPUT`).
+- **Default Video Model (`flow_generate_video` / `flow_extend_video` / `flow_edit_video`)**: **`Omni 1.2 Flash`** (`model="omni"`, default; `macaron_cookie_*` family via standard production video RPCs, with `720p` and `_360p` variants) — supports integer durations **`3..15` seconds** (`default=4`) for Text-to-Video (`macaron_cookie_t2v_*`), Start-Frame (`macaron_cookie_i2v_*`), and Multi-Reference (`macaron_cookie_r2v_*`), **`3..10` seconds** for Start+End-Frame Interpolation (`macaron_cookie_i2v_fl_*`) and Extend (`macaron_cookie_extend_*`, `default=8`), and **`3..15` seconds** clip editing (`macaron_cookie_edit` / `macaron_cookie_edit_360p` via `jIps6`). Veo 3.1 (`model="fast" | "quality" | "lite"`, `8s`) is also supported for generation and extension.
+- **`reference_media_ids` (`flow_generate_video` / `flow_extend_video` / `flow_edit_video`)**: Maximum **`3`** reference images per video call (`> 3` raises `INVALID_INPUT`).
 - **`start_frame_media_id` + `end_frame_media_id`**: `1` start frame + optional `1` end frame (`end_frame_media_id` without `start_frame_media_id` raises `INVALID_INPUT`).
-- **Batch `count` (`flow_generate_video` / `flow_generate_image`)**: **`1..4`** outputs per call (`< 1` or `> 4` raises `INVALID_INPUT`).
+- **Batch `count` (`flow_generate_video` / `flow_edit_video` / `flow_generate_image`)**: **`1..4`** outputs per call (`< 1` or `> 4` raises `INVALID_INPUT`).
 
 ---
 
